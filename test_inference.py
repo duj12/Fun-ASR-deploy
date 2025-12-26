@@ -87,6 +87,7 @@ try:
         
         # 2. Wrap in list!
         print("Input: [audio_data]")
+        audio_data = torch.from_numpy(audio_data)
         res = model.generate(input=[audio_data], batch_size_s=300)
         print(res)
     except Exception as e:
