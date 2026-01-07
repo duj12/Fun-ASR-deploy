@@ -10,13 +10,9 @@ FunASR WebSocket Server (流式语音识别服务)
   - 标点恢复 (Punctuation Restoration)
   - 多用户并发 (基于 ThreadPoolExecutor)
 
-作者: 凌封 aibook.ren(AI全书)
-日期: 2025-12
-"""
-"""
-FunASR-Nano-2512 WebSocket Server
-作者：凌封
-来源：https://aibook.ren (AI全书)
+作者: 
+    凌封 aibook.ren(AI全书)  2025-12
+    thuduj12@163.com        2026-01
 """
 import asyncio
 import json
@@ -61,7 +57,7 @@ def get_args():
     parser.add_argument(
         "--asr_model_online",
         type=str,
-        default="FunAudioLLM/Fun-ASR-Nano-2512",
+        default="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
         help="流式 ASR 模型名称 (从 ModelScope 下载)",
     )
     parser.add_argument("--asr_model_online_revision", type=str, default=None, help="模型版本")
@@ -75,8 +71,9 @@ def get_args():
     parser.add_argument(
         "--punc_model",
         type=str,
-        default="iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
-        help="标点恢复模型名称",
+        # default="iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
+        default="",
+        help="标点恢复模型名称, Fun-ASR-Nano自回归带标点",
     )
     parser.add_argument("--punc_model_revision", type=str, default="v2.0.4", help="模型版本")
     parser.add_argument("--ngpu", type=int, default=1, help="GPU 数量，0 为 CPU")
@@ -123,7 +120,8 @@ model_asr = AutoModel(
 )
 
 # 共享同一个实例
-model_asr_streaming = model_asr
+#model_asr_streaming = model_asr
+model_asr_streaming = AutoModel(model="paraformer-zh-streaming", model_revision="v2.0.4")
 
 # VAD 模型
 model_vad = AutoModel(
