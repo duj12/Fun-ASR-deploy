@@ -1,52 +1,183 @@
-"""
-FunASR-Nano-2512 WebSocket Client
-作者：
-    凌封 https://aibook.ren (AI全书)
-    thuduj12@163.com   2026-01
-"""
-
-
 # -*- encoding: utf-8 -*-
-import websockets
-import ssl
+import os
+import time
+import websockets, ssl
 import asyncio
 import argparse
 import json
-import logging
 from multiprocessing import Process
+
+import logging
 
 logging.basicConfig(level=logging.ERROR)
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--host", type=str, default="localhost", required=False, help="服务端 IP，例如 localhost 或 0.0.0.0"
-)
-parser.add_argument("--port", type=int, default=10095, required=False, help="服务端口")
-parser.add_argument("--chunk_size", type=str, default="5, 10, 5", help="分块大小配置")
-parser.add_argument("--encoder_chunk_look_back", type=int, default=4, help="编码器回溯步数")
-parser.add_argument("--decoder_chunk_look_back", type=int, default=0, help="解码器回溯步数")
-parser.add_argument("--chunk_interval", type=int, default=10, help="分块发送间隔")
-parser.add_argument(
-    "--hotword",
-    type=str,
-    default="",
-    help="热词文件路径，每行一个热词 (例如: 阿里巴巴 20)",
-)
-parser.add_argument("--audio_in", type=str, default=None, help="输入音频文件路径")
-parser.add_argument("--audio_fs", type=int, default=16000, help="音频采样率")
-parser.add_argument("--thread_num", type=int, default=1, help="并发线程数")
-parser.add_argument("--words_max_print", type=int, default=10000, help="最大打印通过数")
-parser.add_argument("--ssl", type=int, default=0, help="是否使用 SSL 连接: 1 为是, 0 为否") # Default 0
-parser.add_argument("--mode", type=str, default="2pass", help="模式: offline, online, 2pass")
+parser.add_argument("--host",
+                    type=str,
+                    default="localhost",
+                    required=False,
+                    help="host ip, localhost, 0.0.0.0")
+parser.add_argument("--port",
+                    type=int,
+                    default=10095,
+                    required=False,
+                    help="grpc server port")
+parser.add_argument("--chunk_size",
+                    type=str,
+                    default="5, 10, 5",
+                    help="chunk")
+parser.add_argument("--chunk_interval",
+                    type=int,
+                    default=10,
+                    help="chunk")
+parser.add_argument("--hotword",
+                    type=str,
+                    default="",
+                    help="hotword file path, one hotword perline (e.g.:阿里巴巴 20). "
+                    "For good recognition result, the hotword score should better be lower than 20.")
+parser.add_argument("--audio_in",
+                    type=str,
+                    default=None,
+                    help="audio_in")
+parser.add_argument("--audio_fs",
+                    type=int,
+                    default=16000,
+                    help="audio_fs")
+parser.add_argument("--send_without_sleep",
+                    action="store_true",
+                    default=True,
+                    help="if audio_in is set, send_without_sleep")
+parser.add_argument("--thread_num",
+                    type=int,
+                    default=1,
+                    help="thread_num")
+parser.add_argument("--words_max_print",
+                    type=int,
+                    default=10000,
+                    help="chunk")
+parser.add_argument("--output_dir",
+                    type=str,
+                    default=None,
+                    help="output_dir")
+
+parser.add_argument("--ssl",
+                    type=int,
+                    default=0,
+                    help="1 for ssl connect, 0 for no ssl")
+parser.add_argument("--itn",
+                    type=int,
+                    default=1,
+                    help="1 for using itn, 0 for not itn")
+parser.add_argument("--vad_tail_sil",
+                    type=int,
+                    default=600,
+                    help="tail silence length for VAD, in ms. "
+                    "if consecutive silence time exceed this value, VAD will cut.")
+parser.add_argument("--vad_max_len",
+                    type=int,
+                    default=20000,
+                    help="max duration of a audio clip cut by VAD, in ms")
+
+parser.add_argument("--vad_energy",
+                    type=int,
+                    default=-35,
+                    help="energy threshold for VAD, in Decibel (dB). better be [-100, -10] negative number."
+                    "if the energy of a audio frame is lower than this value, this frame will be judged as silence.")
+
+# we use itn to control whether to use itn in SenseVoice also.
+# parser.add_argument("--svs_itn",
+#                     type=int,
+#                     default=1,
+#                     help="1 for SenseVoice model using itn, 0 for not itn")
+parser.add_argument("--svs_lang",
+                    type=str,
+                    default='auto',
+                    help="Set language for SenseVoice model: " 
+                    "zh/中, en/英, ja/日, ko/韩, yue/粤, default=auto/自动判别语种")
+
+parser.add_argument("--mode",
+                    type=str,
+                    default="2pass",
+                    help="offline, online, 2pass")
 
 args = parser.parse_args()
 args.chunk_size = [int(x) for x in args.chunk_size.split(",")]
 print(args)
+# voices = asyncio.Queue()
+from queue import Queue
+
+voices = Queue()
+offline_msg_done=False
+
+if args.output_dir is not None:
+    # if os.path.exists(args.output_dir):
+    #     os.remove(args.output_dir)
+        
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
 
-async def send_message(args, websocket):
+def clear_console():
+    print("\033c", end="")
+
+async def record_microphone():
+    is_finished = False
+    import pyaudio
+    global voices
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    RATE = 16000
+    chunk_size = 60 * args.chunk_size[1] / args.chunk_interval
+    CHUNK = int(RATE / 1000 * chunk_size)
+
+    p = pyaudio.PyAudio()
+
+    stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
     # hotwords
-    hotword_dict = {}
+    fst_dict = {}
+    hotword_msg = ""
+    if args.hotword.strip() != "":
+        f_scp = open(args.hotword, encoding='utf-8')
+        hot_lines = f_scp.readlines()
+        for line in hot_lines:
+            words = line.strip().split(" ")
+            if len(words) < 2:
+                print("Please checkout format of hotwords, hotword and score, separated by space")
+                words.append('10')
+            try:
+                fst_dict[" ".join(words[:-1])] = int(words[-1])
+            except ValueError:
+                print("Please checkout format of hotwords")
+        hotword_msg=json.dumps(fst_dict)
+    
+    message = json.dumps({"mode": args.mode, "chunk_size": args.chunk_size, "chunk_interval": args.chunk_interval,
+                          "wav_name": "microphone", "is_speaking": True, "hotwords":hotword_msg, "itn": (args.itn==1), 
+                          "vad_tail_sil": args.vad_tail_sil, "vad_max_len": args.vad_max_len,                           
+                          "vad_energy": args.vad_energy, "svs_lang": args.svs_lang})
+    #voices.put(message)
+    await websocket.send(message)
+    while True:
+        data = stream.read(CHUNK)
+        message = data
+        #voices.put(message)
+        await websocket.send(message)
+        await asyncio.sleep(0.005)
+
+async def record_from_scp(chunk_begin, chunk_size):
+    global voices
+    is_finished = False
+    if args.audio_in.endswith(".scp"):
+        f_scp = open(args.audio_in)
+        wavs = f_scp.readlines()
+    else:
+        wavs = [args.audio_in]
+
+    # hotwords
+    fst_dict = {}
     hotword_msg = ""
     if args.hotword.strip() != "":
         f_scp = open(args.hotword, encoding='utf-8')
@@ -60,118 +191,194 @@ async def send_message(args, websocket):
                 print("Please checkout format of hotwords, hotword and score, separated by space")
                 words.append('10')
             try:
-                hotword_dict[" ".join(words[:-1])] = int(words[-1])
+                fst_dict[" ".join(words[:-1])] = int(words[-1])
             except ValueError:
                 print("Please checkout format of hotwords")
                 
-        # hotword_msg=" ".join(hotword_list) 服务端也支持解析空格分隔的热词
-        hotword_msg=json.dumps(hotword_dict)
+        hotword_msg=json.dumps(fst_dict)
         print (hotword_msg)
-    
-    # 音频源处理
-    wavs = []
-    if args.audio_in is not None:
-        if args.audio_in.endswith(".scp"):
-            f_scp = open(args.audio_in)
-            wavs = f_scp.readlines()
-        else:
-            wavs = [args.audio_in]
-    
-    # 如果没有指定音频输入，直接退出（此处不实现麦克风输入）
-    if not wavs:
-        print("未指定音频输入。请使用 --audio_in 参数")
-        return
 
+    sample_rate = args.audio_fs
+    wav_format = "pcm"
+     
+    if chunk_size > 0:
+        wavs = wavs[chunk_begin:chunk_begin + chunk_size]
     for wav in wavs:
-        wav_path = wav.strip()
-        # 简单的 scp 文件解析
-        if len(wav.split()) > 1:
-                wav_path = wav.split()[1]
-        
-        print(f"正在处理: {wav_path}")
-        
-        # 读取音频文件
-        sample_rate = args.audio_fs
+        wav_splits = wav.strip().split()
+ 
+        wav_name = wav_splits[0] if len(wav_splits) > 1 else "demo"
+        wav_path = wav_splits[1] if len(wav_splits) > 1 else wav_splits[0]
+        if not len(wav_path.strip())>0:
+           continue
         if wav_path.endswith(".pcm"):
             with open(wav_path, "rb") as f:
                 audio_bytes = f.read()
-        elif wav_path.endswith(".wav"):
-            import wave
-            with wave.open(wav_path, "rb") as wav_file:
-                sample_rate = wav_file.getframerate()
-                audio_bytes = wav_file.readframes(wav_file.getnframes())
+        # elif wav_path.endswith(".wav") and 16000 == wave.open(
+        #     wav_path, "rb").getframerate(): 
+        #     with wave.open(wav_path, "rb") as wav_file:
+        #         params = wav_file.getparams()
+        #         frames = wav_file.readframes(wav_file.getnframes())
+        #         audio_bytes = bytes(frames)
         else:
-            # 暂不支持的格式
-            continue
-                
-        # 发送初始配置消息
-        message = json.dumps(
-            {
-                "mode": args.mode,
-                "chunk_size": args.chunk_size,
-                "chunk_interval": args.chunk_interval,
-                "encoder_chunk_look_back": args.encoder_chunk_look_back,
-                "decoder_chunk_look_back": args.decoder_chunk_look_back,
-                "audio_fs": sample_rate,
-                "wav_name": "test",
-                "is_speaking": True,
-                "hotwords": hotword_msg, 
-                "itn": True,
-            }
-        )
-        await websocket.send(message)
+            import ffmpeg
+            try:
+                # This launches a subprocess to decode audio while down-mixing and resampling as necessary.
+                # Requires the ffmpeg CLI and `ffmpeg-python` package to be installed.
+                audio_bytes, _ = (
+                    ffmpeg.input(wav_path, threads=0)
+                    .output("-", format="s16le", acodec="pcm_s16le", ac=1, ar=sample_rate)
+                    .run(cmd=["ffmpeg", "-nostdin"], capture_stdout=True, capture_stderr=True)
+                )
+            except ffmpeg.Error as e:
+                audio_bytes = []
+                logging.info(f"Failed to load audio {wav_path}: {e.stderr.decode()}")
 
-        # 模拟流式发送
-        # 计算步长，例如 60ms (如果 interval 是 10，则每次发送一帧)
-        # 官方逻辑:
-        # stride = int(60 * args.chunk_size[1] / args.chunk_interval / 1000 * sample_rate * 2)
-        # 默认 chunk_size[1] 是 10, interval 10 -> 60ms * 1 = 60ms
-        
         stride = int(60 * args.chunk_size[1] / args.chunk_interval / 1000 * sample_rate * 2)
         chunk_num = (len(audio_bytes) - 1) // stride + 1
+        # print(stride)
+
+        # send first time
+        message = json.dumps({"mode": args.mode, "chunk_size": args.chunk_size, "chunk_interval": args.chunk_interval, "audio_fs":sample_rate,
+                          "wav_name": wav_name, "wav_format": wav_format,  "is_speaking": True, "hotwords":hotword_msg, "itn": (args.itn==1),
+                          "vad_tail_sil": args.vad_tail_sil, "vad_max_len": args.vad_max_len,                           
+                          "vad_energy": args.vad_energy, "svs_lang": args.svs_lang})
+        #voices.put(message)
+        await websocket.send(message)
+        is_speaking = True
         
         for i in range(chunk_num):
-            beg = i * stride
-            data = audio_bytes[beg : beg + stride]
-            await websocket.send(data)
 
-            # 模拟实时延迟
-            sleep_duration = 60 * args.chunk_size[1] / args.chunk_interval / 1000
+            beg = i * stride
+            data = audio_bytes[beg:beg + stride]
+            message = data
+            #voices.put(message)
+            await websocket.send(message)
+            if i == chunk_num - 1:
+                is_speaking = False
+                message = json.dumps({"is_speaking": is_speaking})
+                #voices.put(message)
+                await websocket.send(message)
+                
+                websocket.audio_end_time = time.time()
+ 
+            sleep_duration = 0.001 if args.mode == "offline" else 60 * args.chunk_size[1] / args.chunk_interval / 1000
+            
             await asyncio.sleep(sleep_duration)
-        
-        # 发送结束信号
-        is_speaking = False
-        message = json.dumps({"is_speaking": is_speaking})
-        await websocket.send(message)
     
-    await asyncio.sleep(2)
+    if not args.mode=="offline":
+        await asyncio.sleep(2)
+    # offline model need to wait for message recved
+    
+    if args.mode=="offline":
+      global offline_msg_done
+      while  not  offline_msg_done:
+         await asyncio.sleep(1)
+    
     await websocket.close()
 
-async def recv_message(websocket):
+
+          
+async def message(id):
+    global websocket,voices,offline_msg_done
+    text_print = ""
+    text_print_2pass_online = ""
+    text_print_2pass_offline = ""
+    # if args.output_dir is not None:
+    #     ibest_writer = open(os.path.join(args.output_dir, "text.{}".format(id)), "a", encoding="utf-8")
+    # else:
+    #     ibest_writer = None
+    time_stamp_print = ""
     try:
         while True:
-            response = await websocket.recv()
-            msg = json.loads(response)
-            
-            text = msg.get("text", "")
-            mode = msg.get("mode", "")
-            is_final = msg.get("is_final", False)
-            
-            if mode == "2pass-online" or mode == "online":
-                print(f"[2pass-online] {text}", end="\n")
-            elif mode == "2pass-offline" or mode == "offline":
-                    print(f"[2pass-offline] {text}")
-                                
-    except Exception as e:
-        print("Exception:", e)
         
+            meg = await websocket.recv()
+            meg = json.loads(meg)
+            
+            print("is_final", meg['is_final'])
+            if meg['is_final']: 
+                print(meg)
+                websocket.recv_final_time = time.time()
+
+                # === 计算尾字延迟 ===
+                if hasattr(websocket, "audio_end_time"):
+                    tail_latency = websocket.recv_final_time - websocket.audio_end_time
+                    print(f"\n[尾字延迟 TailLatency] {tail_latency * 1000:.2f} ms\n")
+                else:
+                    print("注意：未记录到 audio_end_time，无法计算尾字延迟")
+            websocket.last_word_time = time.time()
+            wav_name = meg.get("wav_name", "demo")
+            text = meg["text"]
+            if args.output_dir is not None:
+                ibest_writer = open(os.path.join(args.output_dir, "{}.asr.txt".format(wav_name)), "a", encoding="utf-8")
+            else:
+                ibest_writer = None
+
+            offline_msg_done = meg.get("is_final", False)
+            timestamp=""
+            if "timestamp" in meg:
+                timestamp = meg["timestamp"]
+                time_stamp_print += timestamp+"\n"
+
+            if ibest_writer is not None:
+                if timestamp !="":
+                    text_write_line = "{}\t{}\t{}\n".format(wav_name, text, timestamp)
+                else:
+                    text_write_line = "{}\t{}\n".format(wav_name, text)
+                ibest_writer.write(text_write_line)
+
+            if 'mode' not in meg:
+                continue
+            if meg["mode"] == "online":
+                text_print += "{}".format(text)
+                text_print = text_print[-args.words_max_print:]
+                clear_console()
+                print("\rpid" + str(id) + ": " + text_print)
+                
+                if offline_msg_done:
+                    print(time_stamp_print)
+            elif meg["mode"] == "offline":
+                if timestamp !="":
+                    text_print += "{} timestamp: {}".format(text, timestamp)
+                else:
+                    text_print += "{}".format(text)
+
+                print("\rpid" + str(id) + ": " + wav_name + ": " + text_print)
+                offline_msg_done = True
+                print(time_stamp_print)
+            else:
+                if meg["mode"] == "2pass-online":
+                    text_print_2pass_online += "{}".format(text)
+                    text_print = text_print_2pass_offline + text_print_2pass_online
+                else:   # 2pass-offline
+                    text_print_2pass_online = ""
+                    text_print = text_print_2pass_offline + "{}".format(text)
+                    text_print_2pass_offline += "{}".format(text)
+                text_print = text_print[-args.words_max_print:]
+                
+                clear_console()
+                print("\rpid" + str(id) + ": " + text_print)
+                
+                if meg["is_final"]:
+                    offline_msg_done=True
+                    print(time_stamp_print)
+
+    except Exception as e:
+            print("Exception:", e)
+            #traceback.print_exc()
+            #await websocket.close()
+ 
+
+
 
 async def ws_client(id, chunk_begin, chunk_size):
-    if args.audio_in is None:
-        chunk_begin = 0
-        chunk_size = 1
-
-    # URI 连接配置
+  if args.audio_in is None:
+       chunk_begin=0
+       chunk_size=1
+  global websocket,voices,offline_msg_done
+ 
+  for i in range(chunk_begin,chunk_begin+chunk_size):
+    offline_msg_done=False
+    voices = Queue()
     if args.ssl == 1:
         ssl_context = ssl.SSLContext()
         ssl_context.check_hostname = False
@@ -180,23 +387,64 @@ async def ws_client(id, chunk_begin, chunk_size):
     else:
         uri = "ws://{}:{}".format(args.host, args.port)
         ssl_context = None
-
-    print(f"正在连接到 {uri}...")
+    print("connect to", uri)
+    async with websockets.connect(uri, subprotocols=["binary"], ping_interval=None, ssl=ssl_context) as websocket:
+        if args.audio_in is not None:
+            task = asyncio.create_task(record_from_scp(i, 1))
+        else:
+            task = asyncio.create_task(record_microphone())
+        task3 = asyncio.create_task(message(str(id)+"_"+str(i))) 
+        await asyncio.gather(task, task3)
+  exit(0)
     
-    async with websockets.connect(
-        uri, subprotocols=["binary"], ping_interval=None, ssl=ssl_context
-    ) as websocket:
-        task1 = asyncio.create_task(send_message(args, websocket))
-        task2 = asyncio.create_task(recv_message(websocket))
-        await asyncio.gather(task1, task2)
-    
-    exit(0)
-       
 
 def one_thread(id, chunk_begin, chunk_size):
-    asyncio.run(ws_client(id, chunk_begin, chunk_size))
+    asyncio.get_event_loop().run_until_complete(ws_client(id, chunk_begin, chunk_size))
+    asyncio.get_event_loop().run_forever()
 
-if __name__ == "__main__":
-    p = Process(target=one_thread, args=(0, 0, 0))
-    p.start()
-    p.join()
+if __name__ == '__main__':
+    # for microphone
+    if args.audio_in is None:
+        p = Process(target=one_thread, args=(0, 0, 0))
+        p.start()
+        p.join()
+        print('end')
+    else:
+        # calculate the number of wavs for each preocess
+        if args.audio_in.endswith(".scp"):
+            f_scp = open(args.audio_in)
+            wavs = f_scp.readlines()
+        else:
+            wavs = [args.audio_in]
+        for wav in wavs:
+            wav_splits = wav.strip().split()
+            wav_name = wav_splits[0] if len(wav_splits) > 1 else "demo"
+            wav_path = wav_splits[1] if len(wav_splits) > 1 else wav_splits[0]
+            audio_type = os.path.splitext(wav_path)[-1].lower()
+
+
+        total_len = len(wavs)
+        if total_len >= args.thread_num:
+            chunk_size = int(total_len / args.thread_num)
+            remain_wavs = total_len - chunk_size * args.thread_num
+        else:
+            chunk_size = 1
+            remain_wavs = 0
+
+        process_list = []
+        chunk_begin = 0
+        for i in range(args.thread_num):
+            now_chunk_size = chunk_size
+            if remain_wavs > 0:
+                now_chunk_size = chunk_size + 1
+                remain_wavs = remain_wavs - 1
+            # process i handle wavs at chunk_begin and size of now_chunk_size
+            p = Process(target=one_thread, args=(i, chunk_begin, now_chunk_size))
+            chunk_begin = chunk_begin + now_chunk_size
+            p.start()
+            process_list.append(p)
+
+        for i in process_list:
+            p.join()
+
+        print('end')

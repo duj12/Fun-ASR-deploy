@@ -31,7 +31,12 @@ from concurrent.futures import ThreadPoolExecutor
 from funasr.models.fun_asr_nano.model import FunASRNano
 from funasr import AutoModel
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s.%(msecs)03d] %(process)d %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
 # 全局线程池，用于并发执行模型推理，避免阻塞 asyncio 事件循环
 # 建议设置为预期的最大并发数，例如 10
@@ -57,10 +62,10 @@ def get_args():
     parser.add_argument(
         "--asr_model_online",
         type=str,
-        default="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        default="paraformer-zh-streaming",
         help="流式 ASR 模型名称 (从 ModelScope 下载)",
     )
-    parser.add_argument("--asr_model_online_revision", type=str, default=None, help="模型版本")
+    parser.add_argument("--asr_model_online_revision", type=str, default='v2.0.4', help="模型版本")
     parser.add_argument(
         "--vad_model",
         type=str,
@@ -100,14 +105,14 @@ args = get_args()
 
 websocket_users = set()
 
-print("正在加载模型...", flush=True)
+logger.info("Load model...")
 
 # ASR 模型 (离线/2pass + 在线/流式)
 # [优化] 合并模型加载：
 # 原逻辑分别加载了离线和在线模型，导致显存双倍占用 (~7GB)。
 # 经过分析，FunASR 的 AutoModel 是无状态 (Stateless) 的，状态由 status_dict 外部传入。
 # 因此，我们可以共用同一个模型实例，同时服务离线和流式请求，预计节省 2-3GB 显存。
-print(f"正在加载 ASR 模型: {args.asr_model} ...", flush=True)
+logger.info(f"Load ASR Model: {args.asr_model} ...")
 model_asr = AutoModel(
     model=args.asr_model,
     model_revision=args.asr_model_revision,
@@ -121,9 +126,12 @@ model_asr = AutoModel(
 
 # 共享同一个实例
 #model_asr_streaming = model_asr
-model_asr_streaming = AutoModel(model="paraformer-zh-streaming", model_revision="v2.0.4")
+logger.info(f"Load ASR Online Model: {args.asr_model_online} ...")
+model_asr_streaming = AutoModel(
+    model=args.asr_model_online, model_revision=args.asr_model_online_revision)
 
 # VAD 模型
+logger.info(f"Load VAD Model: {args.vad_model} ...")
 model_vad = AutoModel(
     model=args.vad_model,
     model_revision=args.vad_model_revision,
@@ -137,6 +145,7 @@ model_vad = AutoModel(
 
 # 标点模型
 if args.punc_model != "":
+    logger.info(f"Load Punc Model: {args.punc_model} ...")
     model_punc = AutoModel(
         model=args.punc_model,
         model_revision=args.punc_model_revision,
@@ -150,7 +159,13 @@ if args.punc_model != "":
 else:
     model_punc = None
 
-print("模型加载完成！目前支持简单的多用户并发。", flush=True)
+logger.info("Load model finished.")
+logging.root.handlers = []  # 清空modelscope修改后的handlers
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s.%(msecs)03d] %(process)d %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 # 异步模型推理辅助函数
 async def run_model_inference(model, input, **kwargs):
@@ -196,7 +211,7 @@ async def ws_reset(websocket):
     重置 WebSocket 连接对应的状态缓存。
     当连接断开及为了安全起见清理内存时调用。
     """
-    print("ws reset now, total num is ", len(websocket_users))
+    logger.info("ws reset now, total num is ", len(websocket_users))
     if hasattr(websocket, "status_dict_asr_online"):
         websocket.status_dict_asr_online["cache"] = {}
         websocket.status_dict_asr_online["is_final"] = True
@@ -244,14 +259,14 @@ async def ws_serve(websocket, path=None):
     websocket.wav_name = "microphone"
     websocket.mode = "2pass"
     
-    print("new user connected", flush=True)
+    logger.info("new user connected")
 
     try:
         async for message in websocket:
             if isinstance(message, str):
                 try:
                     messagejson = json.loads(message)
-                    
+                    logger.info(messagejson)
                     if "is_speaking" in messagejson:
                         websocket.is_speaking = messagejson["is_speaking"]
                         websocket.status_dict_asr_online["is_final"] = not websocket.is_speaking
@@ -268,8 +283,17 @@ async def ws_serve(websocket, path=None):
                         websocket.status_dict_asr_online["encoder_chunk_look_back"] = messagejson["encoder_chunk_look_back"]
                     if "decoder_chunk_look_back" in messagejson:
                         websocket.status_dict_asr_online["decoder_chunk_look_back"] = messagejson["decoder_chunk_look_back"]
-                    if "hotwords" in messagejson:
-                        websocket.status_dict_asr["hotword"] = messagejson["hotwords"]
+                    if "hotwords" in messagejson and len(messagejson['hotwords'])>0:
+                        hotword_dict = json.loads(messagejson["hotwords"])
+                        hotword_list = list(hotword_dict.keys())
+                        websocket.status_dict_asr["hotwords"] = hotword_list
+                        logger.info(f"hotword_list: {hotword_list}")
+                    if "itn" in messagejson:
+                        itn = messagejson["itn"]
+                        websocket.status_dict_asr["itn"] = itn
+                    if "svs_lang" in messagejson:
+                        language = messagejson['svs_lang']
+                        websocket.status_dict_asr["language"] = language
                     if "mode" in messagejson:
                         websocket.mode = messagejson["mode"]
                         # 兼容 Java 客户端:
@@ -321,7 +345,7 @@ async def ws_serve(websocket, path=None):
                     try:
                         speech_start_i, speech_end_i = await async_vad(websocket, message)
                     except Exception as e:
-                        print("error in vad", e)
+                        logger.error(f"error in vad: {e}")
                         speech_start_i, speech_end_i = -1, -1
                     
                     # 处理 VAD 的语音开始信号
@@ -340,7 +364,7 @@ async def ws_serve(websocket, path=None):
                         try:
                             await async_asr(websocket, audio_in)
                         except Exception as e:
-                            print(f"error in asr offline: {e}")
+                            logger.error(f"error in asr offline: {e}")
                             import traceback
                             traceback.print_exc()
                     
@@ -359,12 +383,12 @@ async def ws_serve(websocket, path=None):
                         frames = frames[-20:]
 
     except websockets.ConnectionClosed:
-        print("连接已关闭。", websocket_users, flush=True)
+        logger.error(f"连接已关闭。{websocket_users}")
         await ws_reset(websocket)
         if websocket in websocket_users:
             websocket_users.remove(websocket)
     except Exception as e:
-        print("Exception:", e)
+        loger.error(f"Exception: {e}")
         import traceback
         traceback.print_exc()
 
@@ -427,6 +451,9 @@ async def async_asr(websocket, audio_in):
         else:
            rec_result = rec_result_list[0]
         
+        text = rec_result['text']
+        if len(text)>0:
+            logger.info(f"2pass-offline: {text}" )
         # 标点恢复
         if model_punc is not None and len(rec_result["text"]) > 0:
             # 异步并发调用标点模型
@@ -450,7 +477,7 @@ async def async_asr(websocket, audio_in):
             await websocket.send(message)
         except Exception as e:
             # 客户端断开，安全忽略
-            print(f"Client disconnected during async_asr send: {e}", flush=True)
+            logger.error(f"Client disconnected during async_asr send: {e}")
     else:
         # Empty audio result
         mode = "2pass-offline" if "2pass" in websocket.mode else websocket.mode
@@ -465,7 +492,7 @@ async def async_asr(websocket, audio_in):
         try:
             await websocket.send(message)
         except Exception as e:
-            print(f"Client disconnected during async_asr empty send: {e}", flush=True)
+            logger.error(f"Client disconnected during async_asr empty send: {e}")
 
 
 async def async_asr_online(websocket, audio_in):
@@ -487,7 +514,9 @@ async def async_asr_online(websocket, audio_in):
         if not rec_result_list or len(rec_result_list) == 0:
              return
         rec_result = rec_result_list[0]
-        
+        text = rec_result['text']
+        if len(text)>0:
+            logger.info(f"2pass-online: {text}" )
         if websocket.mode == "2pass" and websocket.status_dict_asr_online.get("is_final", False):
             return
 
@@ -504,7 +533,7 @@ async def async_asr_online(websocket, audio_in):
             try:
                 await websocket.send(message)
             except Exception as e:
-                print(f"Client disconnected during async_asr_online send: {e}", flush=True)
+                logger.error(f"Client disconnected during async_asr_online send: {e}")
 
 
 async def main():
@@ -520,7 +549,7 @@ async def main():
         start_server = websockets.serve(
             ws_serve, args.host, args.port, subprotocols=None, ping_interval=None
         )
-    print(f"服务已启动，监听地址: ws://{args.host}:{args.port}", flush=True)
+    logger.info(f"服务已启动，监听地址: ws://{args.host}:{args.port}")
     await start_server
     await asyncio.get_event_loop().create_future() # 永久运行
 
