@@ -1,96 +1,15 @@
-# Fun-ASR-Nano-2512 Linux 部署指南
+## 启动服务
 
-Fun-ASR-Nano-2512官方发布的内容有点多，部署起来问题还是比较多，本项目提供一个简化的部署方案。
-
-本项目在 Linux 服务器（配备 NVIDIA GPU）上部署 Fun-ASR-Nano-2512（也有人工操作步骤说明），以及启动一个WS服务提供外部调用，另外包含一些测试验证工具。
-
-在 NVIDIA 3090 显卡上部署，启动完成后占用2590MiB显存，有请求调用后上升到3858MiB显存占用，可以按这个来评估显存需求，目前官方明确说不支持FP16部署，显存只能占么这多了。
-
-## 目录结构
-
-上传本目录所有文件到服务器的 `/data/asr/` 目录：
-
-- `install.sh`: 环境安装脚本
-- `start_server.sh`: 启动 Fun-ASR WebSocket 服务脚本
-- `funasr_wss_server.py`: WebSocket 服务主程序
-- `download_model.py`: 模型下载脚本（安装时下载模型）
-- `test_inference.py`: 本地推理测试脚本（验证环境）
-- `funasr_wss_client.py`: 测试客户端（验证部署是否OK）
-- `web_client`: Web 测试客户端目录，方便WEB页面测试（未实现VAD检测，仅用于测试流式识别）
-
-## 部署步骤
-
-### 0. 环境检查 (Pre-check)
-
-在执行安装前，建议检查服务器的 CUDA 版本，以确保 PyTorch 版本匹配。
-
-**检查命令**:
-
-```bash
-# 方法 1: 查看 NVCC 编译器版本 (推荐，查看实际安装的 Toolkit)
-nvcc -V
-
-# 方法 2: 查看 GPU 驱动状态 (右上角 CUDA Version 为驱动支持的最高版本)
-nvidia-smi
+```pytthon
+python ./funasr_wss_server.py
 ```
-
-- **CUDA 11.x**: 脚本默认安装 PyTorch (cu118)，直接运行即可。
-- **CUDA 12.x**: 建议修改 `install.sh`，将 install torch 的命令改为仅 `pip install torch torchaudio` (通常会自动匹配最新 CUDA 12) 或指定 `--index-url .../cu121`。
-
-**验证安装**:
-
-```bash
-python -c "import torch, torchaudio; print(f'Torch: {torch.__version__}, Audio: {torchaudio.__version__}, CUDA: {torch.cuda.is_available()}')"
-```
-
-### 1. 安装环境
-
-```bash
-cd /data/asr
-chmod +x install.sh start_server.sh
-./install.sh
-```
-
-此步骤会创建 python 虚拟环境，并安装 pytorch, funasr 等依赖。
-
-### 2. 下载模型
-
-```bash
-# 激活环境
-source venv/bin/activate
-# 下载模型
-python download_model.py
-```
-
-**注意**: 该脚本会自动下载 `Fun-ASR-Nano-2512` 主模型以及其依赖的 `Qwen3-0.6B` 子模型，并自动将其放置在正确的子目录结构中。请耐心等待所有下载完成。
-模型将保存在当前目录的 `models/` 文件夹下。
-
-### 3. 测试本地推理 (可选)
-
-```bash
-python test_inference.py
-```
-
-用于验证 GPU 是否正常工作以及显存占用情况。
-
-### 4. 启动服务
-
-```bash
-./start_server.sh
-```
-
-此脚本会调用 `funasr_wss_server.py` 启动服务，监听 `0.0.0.0:10095` 端口。
 
 ## 客户端连接
 
-Java 客户端或测试脚本可以通过 WebSocket 连接：
+```pytthon
+python .\funasr_wss_client.py --audio_in .\example.wav
+```
 
-- URL: `ws://<SERVER_IP>:10095`
-- 协议: FunASR 协议
-
-## 显存优化说明
-
-- 暂无 (FP16 模式目前在部分环境下存在兼容性问题，暂不推荐开启)
 
 ## WebSocket 接口文档
 
@@ -197,7 +116,3 @@ python serve_client.py
   - **注意**: Chrome 默认禁止非 HTTPS 网页使用麦克风。
   - **解决**: 需配置 `chrome://flags/#unsafely-treat-insecure-origin-as-secure` 才能使用麦克风。
 
-## 作者信息
-
-- **作者**：凌封
-- **来源**：[https://aibook.ren (AI全书)](https://aibook.ren)

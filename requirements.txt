@@ -1,0 +1,7 @@
+torch
+torchaudio
+funasr
+modelscope
+transformers
+sentencepiece
+websockets
