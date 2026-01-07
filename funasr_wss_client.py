@@ -144,6 +144,7 @@ async def send_message(args, websocket):
         message = json.dumps({"is_speaking": is_speaking})
         await websocket.send(message)
     
+    await asyncio.sleep(2)
     await websocket.close()
 
 async def recv_message(websocket):
