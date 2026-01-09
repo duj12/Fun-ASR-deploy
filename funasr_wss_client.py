@@ -168,7 +168,7 @@ async def record_microphone():
         await asyncio.sleep(0.005)
 
 async def record_from_scp(chunk_begin, chunk_size):
-    global voices
+    global voices, offline_msg_done
     is_finished = False
     if args.audio_in.endswith(".scp"):
         f_scp = open(args.audio_in)
@@ -265,18 +265,11 @@ async def record_from_scp(chunk_begin, chunk_size):
             
             await asyncio.sleep(sleep_duration)
     
-    if not args.mode=="offline":
-        await asyncio.sleep(2)
-    # offline model need to wait for message recved
-    
-    if args.mode=="offline":
-      global offline_msg_done
-      while  not  offline_msg_done:
-         await asyncio.sleep(1)
-    
-    await websocket.close()
-
-
+        if offline_msg_done:
+            await asyncio.sleep(3)
+            await websocket.close()
+            
+        
           
 async def message(id):
     global websocket,voices,offline_msg_done
@@ -306,6 +299,7 @@ async def message(id):
                 else:
                     print("注意：未记录到 audio_end_time，无法计算尾字延迟")
             websocket.last_word_time = time.time()
+            
             wav_name = meg.get("wav_name", "demo")
             text = meg["text"]
             if args.output_dir is not None:
@@ -331,7 +325,7 @@ async def message(id):
             if meg["mode"] == "online":
                 text_print += "{}".format(text)
                 text_print = text_print[-args.words_max_print:]
-                clear_console()
+                # clear_console()
                 print("\rpid" + str(id) + ": " + text_print)
                 
                 if offline_msg_done:
@@ -343,7 +337,6 @@ async def message(id):
                     text_print += "{}".format(text)
 
                 print("\rpid" + str(id) + ": " + wav_name + ": " + text_print)
-                offline_msg_done = True
                 print(time_stamp_print)
             else:
                 if meg["mode"] == "2pass-online":
@@ -358,9 +351,8 @@ async def message(id):
                 clear_console()
                 print("\rpid" + str(id) + ": " + text_print)
                 
-                if meg["is_final"]:
-                    offline_msg_done=True
-                    print(time_stamp_print)
+            if meg["is_final"]:
+                break
 
     except Exception as e:
             print("Exception:", e)

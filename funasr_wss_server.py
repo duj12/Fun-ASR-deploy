@@ -211,7 +211,7 @@ async def ws_reset(websocket):
     重置 WebSocket 连接对应的状态缓存。
     当连接断开及为了安全起见清理内存时调用。
     """
-    logger.info("ws reset now, total num is ", len(websocket_users))
+    logger.info(f"ws reset now, total num is: {len(websocket_users)}")
     if hasattr(websocket, "status_dict_asr_online"):
         websocket.status_dict_asr_online["cache"] = {}
         websocket.status_dict_asr_online["is_final"] = True
@@ -296,12 +296,8 @@ async def ws_serve(websocket, path=None):
                         websocket.status_dict_asr["language"] = language
                     if "mode" in messagejson:
                         websocket.mode = messagejson["mode"]
-                        # 兼容 Java 客户端:
-                        # Java 客户端请求 "online" 模式，但代码逻辑依赖 "is_final": True 才能结束等待。
-                        # 而 "is_final": True 是由离线识别 (async_asr) 步骤产生的。
-                        # 因此，这里强制将模式升级为 "2pass" (2pass = online流式 + offline离线修正)，确保流程完整。
-                        if websocket.mode == "online":
-                            websocket.mode = "2pass"
+                        # if websocket.mode == "online":
+                        #     websocket.mode = "2pass"
                 except Exception as e:
                     print("JSON error:", e)
 
@@ -367,6 +363,15 @@ async def ws_serve(websocket, path=None):
                             logger.error(f"error in asr offline: {e}")
                             import traceback
                             traceback.print_exc()
+                    else:  # online only
+                        audio_in = b""
+                        try:
+                            await async_asr_online(websocket, audio_in)
+                        except Exception as e:
+                            logger.error(f"error in asr offline: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        
                     
                     # 重置状态
                     frames_asr = []
@@ -470,7 +475,7 @@ async def async_asr(websocket, audio_in):
                 "mode": mode,
                 "text": rec_result["text"],
                 "wav_name": websocket.wav_name,
-                "is_final": True,
+                "is_final": not websocket.is_speaking,
             }
         )
         try:
@@ -486,7 +491,7 @@ async def async_asr(websocket, audio_in):
                 "mode": mode,
                 "text": "",
                 "wav_name": websocket.wav_name,
-                "is_final": True,
+                "is_final": not websocket.is_speaking,
             }
         )
         try:
@@ -534,7 +539,21 @@ async def async_asr_online(websocket, audio_in):
                 await websocket.send(message)
             except Exception as e:
                 logger.error(f"Client disconnected during async_asr_online send: {e}")
-
+    else:
+        # Empty audio result
+        mode = "2pass-online" if "2pass" in websocket.mode else websocket.mode
+        message = json.dumps(
+            {
+                "mode": mode,
+                "text": "",
+                "wav_name": websocket.wav_name,
+                "is_final": not websocket.is_speaking,
+            }
+        )
+        try:
+            await websocket.send(message)
+        except Exception as e:
+            logger.error(f"Client disconnected during async_asr empty send: {e}")
 
 async def main():
     if len(args.certfile) > 0:
