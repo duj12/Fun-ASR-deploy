@@ -43,7 +43,6 @@ python .\funasr_wss_client.py --audio_in .\example.wav
 }
 ```
 
-> **自动兼容**: 如果客户端请求 `mode: "online"`，服务端会自动将其升级为 `mode: "2pass"`，以确保在流式结束后能触发离线修正并返回最终结果（防止部分客户端死等 is_final: true）。
 
 #### b. 音频流传输 (Streaming)
 
@@ -85,14 +84,14 @@ python .\funasr_wss_client.py --audio_in .\example.wav
   "mode": "2pass-offline",
   "text": "最终识别的修正结果。",
   "wav_name": "demo",
-  "is_final": true
 }
 ```
+VAD在语音中间切句，返回的`is_final=False`, 只有当发送音频结束也就是服务端接收到`is_speaking: false` 才会返回`is_final=True`表示识别结束。
 
-> **注意**: 
-> 
-> 1. 为了防止客户端超时，即使离线识别结果为空（如误触 VAD），服务端也会发送一个 `text: ""` 且 `is_final: true` 的空包。
-> 2. Java 客户端通常只处理 `is_final: true` 的消息。
+客户端判断是否是流式临时结果，还是二遍解码最终结果，根据mode字段判断。
+
+is_final仅用于表示服务端是否已经完成全部输入语音的识别。客户端收到is_final=True，即可安全断开连接。
+
 
 ## Web 测试客户端 (New)
 
