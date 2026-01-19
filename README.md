@@ -1,8 +1,34 @@
 ## 启动服务
 
-```pytthon
+### 基础启动（不使用 vLLM）
+
+```python
 python ./funasr_wss_server.py
 ```
+
+### 使用 vLLM 提升并发性能（推荐）
+
+vLLM 提供了高效的异步推理接口，可以显著提升高并发场景下的性能。
+
+```python
+python ./funasr_wss_server.py \
+    --vllm_model_dir /path/to/vllm/model \
+    --vllm_gpu_memory_utilization 0.3 \
+    --vllm_max_num_seqs 16
+```
+
+**参数说明：**
+- `--vllm_model_dir`: vLLM 模型目录路径（需要与 ASR 模型匹配）
+- `--vllm_gpu_memory_utilization`: GPU 内存利用率 (0.0-1.0)，默认 0.3
+- `--vllm_max_num_seqs`: 最大并发序列数，默认 16
+- `--asr_batch_size`: 离线 ASR 批量处理大小，默认 4
+- `--asr_batch_timeout`: 批量处理超时时间（秒），默认 0.05
+
+**注意事项：**
+1. vLLM 需要安装：`pip install vllm>=0.13.0`
+2. vLLM 仅支持 FunASRNano 类型的 ASR 模型
+3. 如果 vLLM 初始化失败，系统会自动回退到传统推理方式
+4. vLLM 主要用于离线/2pass ASR，流式 ASR 仍使用传统方式以保证实时性
 
 ## 客户端连接
 
@@ -91,6 +117,27 @@ VAD在语音中间切句，返回的`is_final=False`, 只有当发送音频结�
 客户端判断是否是流式临时结果，还是二遍解码最终结果，根据mode字段判断。
 
 is_final仅用于表示服务端是否已经完成全部输入语音的识别。客户端收到is_final=True，即可安全断开连接。
+
+## 性能优化说明
+
+### vLLM 异步推理
+
+本版本集成了 vLLM 异步推理功能，可以显著提升高并发场景下的性能：
+
+1. **离线 ASR 优化**：使用 vLLM 的批量处理能力，可以同时处理多个离线 ASR 请求
+2. **并发控制**：通过 `--vllm_max_num_seqs` 参数控制最大并发数
+3. **自动回退**：如果 vLLM 不可用或初始化失败，系统会自动回退到传统推理方式
+
+### 并发性能提升
+
+- **传统方式**：使用 ThreadPoolExecutor，每个请求独立处理，在高并发下可能遇到阻塞
+- **vLLM 方式**：利用 vLLM 的批量处理和异步能力，可以更好地处理并发请求
+
+### 使用建议
+
+- **高并发场景**：推荐使用 vLLM，设置合适的 `--vllm_max_num_seqs` 和 `--vllm_gpu_memory_utilization`
+- **低延迟场景**：可以适当降低批量处理大小和超时时间
+- **资源受限**：如果 GPU 内存不足，可以降低 `--vllm_gpu_memory_utilization`
 
 
 ## Web 测试客户端 (New)

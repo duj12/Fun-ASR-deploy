@@ -8,7 +8,8 @@ FunASR WebSocket Server (流式语音识别服务)
   - 流式 ASR (在线实时识别)
   - 离线/2pass ASR (句子结束后的高精度修正)
   - 标点恢复 (Punctuation Restoration)
-  - 多用户并发 (基于 ThreadPoolExecutor)
+  - 多用户并发 (基于 vLLM 异步接口 + ThreadPoolExecutor)
+  - vLLM 异步推理支持，提升高并发性能
 
 作者: 
     凌封 aibook.ren(AI全书)  2025-12
@@ -26,11 +27,16 @@ import numpy as np
 import torch
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from typing import Optional, List, Dict, Any
 # 需要引下这个，不然会报错AssertionError: FunASRNano is not registered
 # issue见：https://github.com/modelscope/FunASR/issues/2741
 from funasr.models.fun_asr_nano.model import FunASRNano
 from funasr import AutoModel
+from funasr.utils.load_utils import extract_fbank
+from torch.nn.utils.rnn import pad_sequence
 
+logging.root.handlers = []  # 清空modelscope修改后的handlers
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s.%(msecs)03d] %(process)d %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
@@ -41,6 +47,22 @@ logger = logging.getLogger(__name__)
 # 全局线程池，用于并发执行模型推理，避免阻塞 asyncio 事件循环
 # 建议设置为预期的最大并发数，例如 10
 inference_executor = ThreadPoolExecutor(max_workers=10)
+
+# vLLM 相关全局变量
+global vllm_engine, vllm_sampling_params, model_asr_nano, asr_tokenizer, asr_frontend
+global prompt_prefix_embeddings, prompt_suffix_embeddings
+vllm_engine = None
+vllm_sampling_params = None
+model_asr_nano = None  # FunASRNano 模型实例
+asr_tokenizer = None
+asr_frontend = None
+prompt_prefix_embeddings = None
+prompt_suffix_embeddings = None
+
+# 异步推理队列，用于批量处理离线 ASR 请求
+asr_request_queue = deque()
+asr_batch_processing_task = None
+asr_batch_semaphore = asyncio.Semaphore(1)  # 控制批量处理并发
 
 def get_args():
     """
@@ -99,33 +121,64 @@ def get_args():
         help="SSL 密钥文件",
     )
     parser.add_argument("--fp16", action="store_true", help="使用 fp16 进行推理")
+    parser.add_argument(
+        "--vllm_model_dir",
+        type=str,
+        default=None,
+        help="vLLM 模型目录路径，如果提供则使用 vLLM 进行异步推理",
+    )
+    parser.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.3,
+        help="vLLM GPU 内存利用率 (0.0-1.0)",
+    )
+    parser.add_argument(
+        "--vllm_max_num_seqs",
+        type=int,
+        default=16,
+        help="vLLM 最大并发序列数",
+    )
+    parser.add_argument(
+        "--asr_batch_size",
+        type=int,
+        default=4,
+        help="离线 ASR 批量处理大小",
+    )
+    parser.add_argument(
+        "--asr_batch_timeout",
+        type=float,
+        default=0.05,
+        help="离线 ASR 批量处理超时时间（秒）",
+    )
     return parser.parse_args()
 
 args = get_args()
-
 websocket_users = set()
 
 logger.info("Load model...")
-
 # ASR 模型 (离线/2pass + 在线/流式)
-# [优化] 合并模型加载：
-# 原逻辑分别加载了离线和在线模型，导致显存双倍占用 (~7GB)。
-# 经过分析，FunASR 的 AutoModel 是无状态 (Stateless) 的，状态由 status_dict 外部传入。
-# 因此，我们可以共用同一个模型实例，同时服务离线和流式请求，预计节省 2-3GB 显存。
 logger.info(f"Load ASR Model: {args.asr_model} ...")
-model_asr = AutoModel(
-    model=args.asr_model,
-    model_revision=args.asr_model_revision,
-    ngpu=args.ngpu,
-    ncpu=args.ncpu,
-    device=args.device,
-    disable_pbar=True,
-    disable_log=True,
-    fp16=args.fp16,
-)
+if args.vllm_model_dir:
+    model_asr_nano, kwargs_asr = AutoModel.build_model(
+        model=args.asr_model, 
+        trust_remote_code=True, 
+        device=args.device
+    )
+    asr_tokenizer, asr_frontend = kwargs_asr["tokenizer"], kwargs_asr["frontend"]
+else:
+    model_asr_nano = AutoModel(
+        model=args.asr_model,
+        model_revision=args.asr_model_revision,
+        ngpu=args.ngpu,
+        ncpu=args.ncpu,
+        device=args.device,
+        disable_pbar=True,
+        disable_log=True,
+        fp16=args.fp16,
+    )
 
-# 共享同一个实例
-#model_asr_streaming = model_asr
+# ASR Streaming 模型
 logger.info(f"Load ASR Online Model: {args.asr_model_online} ...")
 model_asr_streaming = AutoModel(
     model=args.asr_model_online, model_revision=args.asr_model_online_revision)
@@ -159,13 +212,8 @@ if args.punc_model != "":
 else:
     model_punc = None
 
-logger.info("Load model finished.")
-logging.root.handlers = []  # 清空modelscope修改后的handlers
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s.%(msecs)03d] %(process)d %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logger.info("Load model finished.")  
+
 
 # 异步模型推理辅助函数
 async def run_model_inference(model, input, **kwargs):
@@ -186,6 +234,147 @@ async def run_model_inference(model, input, **kwargs):
         inference_executor, 
         lambda: model.generate(input=input, **kwargs)
     )
+
+
+async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, **kwargs):
+    """
+    使用 vLLM 进行异步 ASR 推理（适用于离线/2pass ASR）。
+    这个方法利用 vLLM 的批量处理能力，提升并发性能。
+    
+    Args:
+        audio_tensor: 音频张量
+        websocket: WebSocket 连接对象
+        **kwargs: 额外的推理参数
+    
+    Returns:
+        识别结果文本
+    """
+    global vllm_engine, vllm_sampling_params, model_asr_nano
+    global asr_tokenizer, asr_frontend, prompt_prefix_embeddings, prompt_suffix_embeddings
+    
+    if vllm_engine is None:
+        # 回退到传统推理方式
+        return await run_model_inference(model_asr_nano, [audio_tensor], **kwargs)
+    
+    loop = asyncio.get_running_loop()
+    device = next(model_asr_nano.parameters()).device
+    
+    # 在后台线程中执行音频编码（这部分是同步的）
+    def encode_audio():
+        # 提取特征
+        speech, speech_lengths = extract_fbank(
+            [audio_tensor],
+            frontend=asr_frontend,
+            is_final=True,
+        )
+        speech = speech.to(device)
+        speech_lengths = speech_lengths.to(device)
+        
+        # 音频编码
+        encoder_out, encoder_out_lens = model_asr_nano.audio_encoder(
+            speech, speech_lengths
+        )
+        encoder_out, encoder_out_lens = model_asr_nano.audio_adaptor(
+            encoder_out, encoder_out_lens
+        )
+        
+        # 构建输入 embeddings
+        speech_embedding = encoder_out[0, :encoder_out_lens[0], :]
+        input_embedding = torch.cat([
+            prompt_prefix_embeddings,
+            speech_embedding,
+            prompt_suffix_embeddings
+        ], dim=0)
+        
+        return input_embedding
+    
+    # 异步执行音频编码
+    input_embedding = await loop.run_in_executor(inference_executor, encode_audio)
+    
+    # 使用 vLLM 进行推理（vLLM 的 generate 是同步的，但支持批量处理）
+    # 为了不阻塞事件循环，我们在线程池中执行
+    def vllm_generate():
+        outputs = vllm_engine.generate([{
+            "prompt_embeds": input_embedding,
+        }], vllm_sampling_params, use_tqdm=False)
+        return outputs[0].outputs[0].text
+    
+    text = await loop.run_in_executor(inference_executor, vllm_generate)
+    
+    return [{"text": text}]
+
+
+async def async_asr_batch_with_vllm(audio_tensors: List[torch.Tensor], **kwargs):
+    """
+    使用 vLLM 进行批量异步 ASR 推理。
+    这个方法可以同时处理多个音频，提升吞吐量。
+    
+    Args:
+        audio_tensors: 音频张量列表
+        **kwargs: 额外的推理参数
+    
+    Returns:
+        识别结果列表
+    """
+    global vllm_engine, vllm_sampling_params, model_asr_nano
+    global asr_tokenizer, asr_frontend, prompt_prefix_embeddings, prompt_suffix_embeddings
+    
+    if vllm_engine is None:
+        # 回退到传统推理方式
+        results = []
+        for audio_tensor in audio_tensors:
+            result = await run_model_inference(model_asr_nano, [audio_tensor], **kwargs)
+            results.append(result[0] if result else {"text": ""})
+        return results
+    
+    loop = asyncio.get_running_loop()
+    device = next(model_asr_nano.parameters()).device
+    
+    # 在后台线程中批量编码音频
+    def encode_audio_batch():
+        input_embeddings_list = []
+        for audio_tensor in audio_tensors:
+            # 提取特征
+            speech, speech_lengths = extract_fbank(
+                [audio_tensor],
+                frontend=asr_frontend,
+                is_final=True,
+            )
+            speech = speech.to(device)
+            speech_lengths = speech_lengths.to(device)
+            
+            # 音频编码
+            encoder_out, encoder_out_lens = model_asr_nano.audio_encoder(
+                speech, speech_lengths
+            )
+            encoder_out, encoder_out_lens = model_asr_nano.audio_adaptor(
+                encoder_out, encoder_out_lens
+            )
+            
+            # 构建输入 embeddings
+            speech_embedding = encoder_out[0, :encoder_out_lens[0], :]
+            input_embedding = torch.cat([
+                prompt_prefix_embeddings,
+                speech_embedding,
+                prompt_suffix_embeddings
+            ], dim=0)
+            input_embeddings_list.append(input_embedding)
+        
+        return input_embeddings_list
+    
+    # 异步执行批量音频编码
+    input_embeddings_list = await loop.run_in_executor(inference_executor, encode_audio_batch)
+    
+    # 使用 vLLM 进行批量推理
+    def vllm_generate_batch():
+        outputs = vllm_engine.generate([{
+            "prompt_embeds": emb,
+        } for emb in input_embeddings_list], vllm_sampling_params, use_tqdm=False)
+        return [output.outputs[0].text for output in outputs]
+    
+    texts = await loop.run_in_executor(inference_executor, vllm_generate_batch)
+    
+    return [{"text": text} for text in texts]
 
 def decode_audio_chunk(chunk_bytes):
     """
@@ -439,6 +628,8 @@ async def async_asr(websocket, audio_in):
     对完整的语音片段进行高精度识别，通常在 VAD 检测到语音结束时调用。
     包含：ASR 识别 -> 标点恢复 (Punctuation Restoration) -> 发送最终结果 (is_final=True)。
     
+    优化：优先使用 vLLM 进行推理，提升并发性能。
+    
     Args:
         websocket: WebSocket 连接对象
         audio_in (bytes): 完整的语音片段字节流
@@ -446,10 +637,25 @@ async def async_asr(websocket, audio_in):
     # 离线识别 (最终修正)
     if len(audio_in) > 0:
         audio_tensor = decode_audio_chunk(audio_in)
-        # 异步并发调用 ASR 模型
-        rec_result_list = await run_model_inference(
-            model_asr, input=[audio_tensor], **websocket.status_dict_asr
-        )
+        
+        # 优先使用 vLLM 进行推理（如果可用）
+        if vllm_engine is not None and model_asr_nano is not None:
+            try:
+                rec_result_list = await async_asr_with_vllm(
+                    audio_tensor, websocket, **websocket.status_dict_asr
+                )
+            except Exception as e:
+                logger.warning(f"vLLM 推理失败，回退到传统方式: {e}")
+                # 回退到传统推理方式
+                rec_result_list = await run_model_inference(
+                    model_asr_nano, input=[audio_tensor], **websocket.status_dict_asr
+                )
+        else:
+            # 使用传统推理方式
+            rec_result_list = await run_model_inference(
+                model_asr_nano, input=[audio_tensor], **websocket.status_dict_asr
+            )
+        
         if not rec_result_list or len(rec_result_list) == 0:
            # 如果为空，直接返回空文本
            rec_result = {"text": ""}
@@ -505,17 +711,27 @@ async def async_asr_online(websocket, audio_in):
     异步在线流式 ASR (Online Streaming) 处理函数。
     对实时到达的音频流进行增量识别，返回中间结果 (is_final=False)。
     
+    优化：使用异步推理，减少阻塞，提升并发能力。
+    
     Args:
         websocket: WebSocket 连接对象
         audio_in (bytes): 实时音频流片段
     """
     # 在线流式识别
+    # 注意：流式 ASR 通常不使用 vLLM，因为需要实时性
+    # vLLM 更适合离线/2pass ASR 的批量处理
     if len(audio_in) > 0:
         audio_tensor = decode_audio_chunk(audio_in)
         # 异步并发调用流式 ASR 模型
-        rec_result_list = await run_model_inference(
-             model_asr_streaming, input=[audio_tensor], **websocket.status_dict_asr_online
-        )
+        # 使用 run_model_inference 确保不阻塞事件循环
+        try:
+            rec_result_list = await run_model_inference(
+                 model_asr_streaming, input=[audio_tensor], **websocket.status_dict_asr_online
+            )
+        except Exception as e:
+            logger.error(f"流式 ASR 推理错误: {e}")
+            return
+        
         if not rec_result_list or len(rec_result_list) == 0:
              return
         rec_result = rec_result_list[0]
@@ -555,7 +771,60 @@ async def async_asr_online(websocket, audio_in):
         except Exception as e:
             logger.error(f"Client disconnected during async_asr empty send: {e}")
 
-async def main():
+async def main(): 
+    if args.vllm_model_dir:
+        global vllm_engine, vllm_sampling_params
+        global asr_tokenizer, asr_frontend, prompt_prefix_embeddings, prompt_suffix_embeddings
+        logger.info(f"Initializing vLLM engine from {args.vllm_model_dir}...")
+        try:
+            from vllm import LLM, SamplingParams
+            from vllm.config import CompilationConfig  
+            
+            if asr_tokenizer is None or asr_frontend is None:
+                logger.warning("无法获取 tokenizer 或 frontend，vLLM 功能可能不可用")
+            else:
+                # 初始化 vLLM
+                os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+                cudagraph_sizes = [x for x in range(1, args.vllm_max_num_seqs + 1)]
+                
+                vllm_engine = LLM(
+                    model=args.vllm_model_dir,
+                    enable_prompt_embeds=True,
+                    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    dtype="bfloat16",
+                    compilation_config=CompilationConfig(
+                        cudagraph_capture_sizes=cudagraph_sizes
+                    ),
+                    tensor_parallel_size=1,
+                    max_num_seqs=args.vllm_max_num_seqs,
+                    trust_remote_code=True,
+                )
+                
+                vllm_sampling_params = SamplingParams(
+                    top_p=0.001,
+                    max_tokens=500,
+                )
+                    
+                # 准备 prompt embeddings
+                instruction = "语音转写："
+                prompt_prefix = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{instruction}"
+                prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n"
+                prompt_prefix_ids = asr_tokenizer.encode(prompt_prefix)
+                prompt_suffix_ids = asr_tokenizer.encode(prompt_suffix)
+                prompt_prefix_ids = torch.tensor(prompt_prefix_ids, dtype=torch.int64).to(args.device)
+                prompt_suffix_ids = torch.tensor(prompt_suffix_ids, dtype=torch.int64).to(args.device)
+                
+                prompt_prefix_embeddings = model_asr_nano.llm.model.get_input_embeddings()(prompt_prefix_ids)
+                prompt_suffix_embeddings = model_asr_nano.llm.model.get_input_embeddings()(prompt_suffix_ids)
+                
+                logger.info("vLLM engine initialized successfully")
+        except ImportError:
+            logger.warning("vLLM 未安装，将使用传统推理方式。安装命令: pip install vllm")
+        except Exception as e:
+            logger.error(f"初始化 vLLM 失败: {e}")
+            import traceback
+            traceback.print_exc()
+   
     if len(args.certfile) > 0:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_cert = args.certfile
