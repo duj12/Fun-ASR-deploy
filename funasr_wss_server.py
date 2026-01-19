@@ -50,14 +50,56 @@ inference_executor = ThreadPoolExecutor(max_workers=10)
 
 # vLLM 相关全局变量
 global vllm_engine, vllm_sampling_params, model_asr_nano, asr_tokenizer, asr_frontend
-global prompt_prefix_embeddings, prompt_suffix_embeddings
 vllm_engine = None
 vllm_sampling_params = None
-model_asr_nano = None  # FunASRNano 模型实例
+model_asr_nano = None  # FunASRNano 模型实例或带 llm 的 ASR 模型
 asr_tokenizer = None
 asr_frontend = None
-prompt_prefix_embeddings = None
-prompt_suffix_embeddings = None
+
+# 语言代码到可读文本的映射（用于构造自然语言 prompt）
+LANG_TEXT_MAP = {
+    "zh": "中文",
+    "en": "英文",
+    "ja": "日文",
+}
+
+
+def build_prompt(hotwords, language_code, itn):
+    """
+    根据 itn、hotwords、language 构造文本提示，逻辑参考 Fun-ASR-vllm/model.py(553-568)。
+    - hotwords: List[str]
+    - language_code: "zh" / "en" / "ja" / 其它
+    - itn: bool
+    """
+    hotwords = hotwords or []
+    # 1. 热词上下文
+    if len(hotwords) > 0:
+        hotwords_str = ", ".join(hotwords)
+        prompt = (
+            "请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n"
+            "**上下文信息：**\n\n\n"
+        )
+        prompt += f"热词列表：[{hotwords_str}]\n"
+    else:
+        prompt = ""
+
+    # 2. 语言
+    lang_text = None
+    if language_code is not None:
+        # 客户端传 zh/en/ja，这里转成中文描述；若是其它值，则直接拼接
+        lang_text = LANG_TEXT_MAP.get(language_code, language_code)
+
+    if lang_text is None:
+        prompt += "语音转写"
+    else:
+        prompt += f"语音转写成{lang_text}"
+
+    # 3. 是否 ITN
+    if itn is False:
+        prompt += "，不进行文本规整"
+
+    prompt += "："
+    return prompt
 
 # 异步推理队列，用于批量处理离线 ASR 请求
 asr_request_queue = deque()
@@ -239,7 +281,7 @@ async def run_model_inference(model, input, **kwargs):
 async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, **kwargs):
     """
     使用 vLLM 进行异步 ASR 推理（适用于离线/2pass ASR）。
-    这个方法利用 vLLM 的批量处理能力，提升并发性能。
+    结合 itn / hotwords / language 动态构造 prompt，并计算 embeddings 后再 generate。
     
     Args:
         audio_tensor: 音频张量
@@ -247,21 +289,29 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, **kwargs):
         **kwargs: 额外的推理参数
     
     Returns:
-        识别结果文本
+        List[{"text": str}]
     """
     global vllm_engine, vllm_sampling_params, model_asr_nano
-    global asr_tokenizer, asr_frontend, prompt_prefix_embeddings, prompt_suffix_embeddings
-    
-    if vllm_engine is None:
-        # 回退到传统推理方式
+    global asr_tokenizer, asr_frontend
+
+    # 如果 vLLM 未初始化，则回退到传统 FunASR 推理
+    if vllm_engine is None or model_asr_nano is None or asr_tokenizer is None or asr_frontend is None:
         return await run_model_inference(model_asr_nano, [audio_tensor], **kwargs)
-    
+
+    # 1. 从 websocket / kwargs 里拿到 itn / hotwords / language 参数
+    # websocket.status_dict_asr 由 ws_serve 中 JSON 消息填充
+    itn = kwargs.get("itn", websocket.status_dict_asr.get("itn", True))
+    hotwords = kwargs.get("hotwords", websocket.status_dict_asr.get("hotwords", []))
+    language_code = kwargs.get("language", websocket.status_dict_asr.get("language", None))
+
+    prompt = build_prompt(hotwords, language_code, itn)
+
+    # 2. 构造 LLM prompt，并计算文本 embeddings
     loop = asyncio.get_running_loop()
     device = next(model_asr_nano.parameters()).device
-    
-    # 在后台线程中执行音频编码（这部分是同步的）
-    def encode_audio():
-        # 提取特征
+
+    def encode_audio_and_prompt():
+        # 2.1 特征提取
         speech, speech_lengths = extract_fbank(
             [audio_tensor],
             frontend=asr_frontend,
@@ -269,38 +319,43 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, **kwargs):
         )
         speech = speech.to(device)
         speech_lengths = speech_lengths.to(device)
-        
-        # 音频编码
-        encoder_out, encoder_out_lens = model_asr_nano.audio_encoder(
-            speech, speech_lengths
+
+        # 2.2 音频编码
+        encoder_out, encoder_out_lens = model_asr_nano.audio_encoder(speech, speech_lengths)
+        encoder_out, encoder_out_lens = model_asr_nano.audio_adaptor(encoder_out, encoder_out_lens)
+
+        # 2.3 文本 prompt -> token ids -> embeddings
+        instruction_prompt = (
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n{prompt}"
         )
-        encoder_out, encoder_out_lens = model_asr_nano.audio_adaptor(
-            encoder_out, encoder_out_lens
-        )
-        
-        # 构建输入 embeddings
-        speech_embedding = encoder_out[0, :encoder_out_lens[0], :]
-        input_embedding = torch.cat([
-            prompt_prefix_embeddings,
-            speech_embedding,
-            prompt_suffix_embeddings
-        ], dim=0)
-        
+        prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n"
+
+        prefix_ids = asr_tokenizer.encode(instruction_prompt)
+        suffix_ids = asr_tokenizer.encode(prompt_suffix)
+
+        emb_layer = model_asr_nano.llm.model.get_input_embeddings()
+        prefix_emb = emb_layer(torch.tensor(prefix_ids, dtype=torch.int64, device=device))
+        suffix_emb = emb_layer(torch.tensor(suffix_ids, dtype=torch.int64, device=device))
+
+        # 2.4 拼接：prefix + speech_emb + suffix
+        speech_emb = encoder_out[0, :encoder_out_lens[0], :]
+        input_embedding = torch.cat([prefix_emb, speech_emb, suffix_emb], dim=0)
         return input_embedding
-    
-    # 异步执行音频编码
-    input_embedding = await loop.run_in_executor(inference_executor, encode_audio)
-    
-    # 使用 vLLM 进行推理（vLLM 的 generate 是同步的，但支持批量处理）
-    # 为了不阻塞事件循环，我们在线程池中执行
+
+    # 在线程池中做编码，避免阻塞事件循环
+    input_embedding = await loop.run_in_executor(inference_executor, encode_audio_and_prompt)
+
+    # 3. 调用 vLLM generate，同样放在线程池中
     def vllm_generate():
-        outputs = vllm_engine.generate([{
-            "prompt_embeds": input_embedding,
-        }], vllm_sampling_params, use_tqdm=False)
+        outputs = vllm_engine.generate(
+            [{"prompt_embeds": input_embedding}],
+            vllm_sampling_params,
+            use_tqdm=False,
+        )
         return outputs[0].outputs[0].text
-    
+
     text = await loop.run_in_executor(inference_executor, vllm_generate)
-    
     return [{"text": text}]
 
 
@@ -317,9 +372,9 @@ async def async_asr_batch_with_vllm(audio_tensors: List[torch.Tensor], **kwargs)
         识别结果列表
     """
     global vllm_engine, vllm_sampling_params, model_asr_nano
-    global asr_tokenizer, asr_frontend, prompt_prefix_embeddings, prompt_suffix_embeddings
+    global asr_tokenizer, asr_frontend
     
-    if vllm_engine is None:
+    if vllm_engine is None or model_asr_nano is None or asr_tokenizer is None or asr_frontend is None:
         # 回退到传统推理方式
         results = []
         for audio_tensor in audio_tensors:
@@ -329,10 +384,28 @@ async def async_asr_batch_with_vllm(audio_tensors: List[torch.Tensor], **kwargs)
     
     loop = asyncio.get_running_loop()
     device = next(model_asr_nano.parameters()).device
-    
-    # 在后台线程中批量编码音频
+
+    # 这里为了简单：对整个 batch 使用同一套 itn/hotwords/language，可根据需要扩展为逐条不同
+    itn = kwargs.get("itn", True)
+    hotwords = kwargs.get("hotwords", [])
+    language_code = kwargs.get("language", None)
+    prompt = build_prompt(hotwords, language_code, itn)
+
     def encode_audio_batch():
         input_embeddings_list = []
+
+        # 构造统一的文字 prompt embeddings
+        instruction_prompt = (
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n{prompt}"
+        )
+        prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n"
+        prefix_ids = asr_tokenizer.encode(instruction_prompt)
+        suffix_ids = asr_tokenizer.encode(prompt_suffix)
+        emb_layer = model_asr_nano.llm.model.get_input_embeddings()
+        prefix_emb = emb_layer(torch.tensor(prefix_ids, dtype=torch.int64, device=device))
+        suffix_emb = emb_layer(torch.tensor(suffix_ids, dtype=torch.int64, device=device))
+
         for audio_tensor in audio_tensors:
             # 提取特征
             speech, speech_lengths = extract_fbank(
@@ -342,38 +415,29 @@ async def async_asr_batch_with_vllm(audio_tensors: List[torch.Tensor], **kwargs)
             )
             speech = speech.to(device)
             speech_lengths = speech_lengths.to(device)
-            
+
             # 音频编码
-            encoder_out, encoder_out_lens = model_asr_nano.audio_encoder(
-                speech, speech_lengths
-            )
-            encoder_out, encoder_out_lens = model_asr_nano.audio_adaptor(
-                encoder_out, encoder_out_lens
-            )
-            
-            # 构建输入 embeddings
-            speech_embedding = encoder_out[0, :encoder_out_lens[0], :]
-            input_embedding = torch.cat([
-                prompt_prefix_embeddings,
-                speech_embedding,
-                prompt_suffix_embeddings
-            ], dim=0)
+            encoder_out, encoder_out_lens = model_asr_nano.audio_encoder(speech, speech_lengths)
+            encoder_out, encoder_out_lens = model_asr_nano.audio_adaptor(encoder_out, encoder_out_lens)
+
+            # 构建输入 embeddings: prefix + speech_emb + suffix
+            speech_emb = encoder_out[0, :encoder_out_lens[0], :]
+            input_embedding = torch.cat([prefix_emb, speech_emb, suffix_emb], dim=0)
             input_embeddings_list.append(input_embedding)
-        
+
         return input_embeddings_list
-    
-    # 异步执行批量音频编码
+
     input_embeddings_list = await loop.run_in_executor(inference_executor, encode_audio_batch)
-    
-    # 使用 vLLM 进行批量推理
+
     def vllm_generate_batch():
-        outputs = vllm_engine.generate([{
-            "prompt_embeds": emb,
-        } for emb in input_embeddings_list], vllm_sampling_params, use_tqdm=False)
+        outputs = vllm_engine.generate(
+            [{"prompt_embeds": emb} for emb in input_embeddings_list],
+            vllm_sampling_params,
+            use_tqdm=False,
+        )
         return [output.outputs[0].text for output in outputs]
-    
+
     texts = await loop.run_in_executor(inference_executor, vllm_generate_batch)
-    
     return [{"text": text} for text in texts]
 
 def decode_audio_chunk(chunk_bytes):
@@ -481,8 +545,19 @@ async def ws_serve(websocket, path=None):
                         itn = messagejson["itn"]
                         websocket.status_dict_asr["itn"] = itn
                     if "svs_lang" in messagejson:
-                        language = messagejson['svs_lang']
+                        # 客户端传 zh/en/ja 这样的代码，这里直接保存，后续在 build_prompt 里映射为中文描述
+                        language = messagejson["svs_lang"]
                         websocket.status_dict_asr["language"] = language
+                    # VAD 相关参数映射：客户端字段 -> VAD status_dict 字段
+                    # vad_tail_sil  -> max_end_silence_time
+                    # vad_max_len   -> max_single_segment_time
+                    # vad_energy    -> decibel_thres
+                    if "vad_tail_sil" in messagejson:
+                        websocket.status_dict_vad["max_end_silence_time"] = messagejson["vad_tail_sil"]
+                    if "vad_max_len" in messagejson:
+                        websocket.status_dict_vad["max_single_segment_time"] = messagejson["vad_max_len"]
+                    if "vad_energy" in messagejson:
+                        websocket.status_dict_vad["decibel_thres"] = messagejson["vad_energy"]
                     if "mode" in messagejson:
                         websocket.mode = messagejson["mode"]
                         # if websocket.mode == "online":
@@ -582,7 +657,7 @@ async def ws_serve(websocket, path=None):
         if websocket in websocket_users:
             websocket_users.remove(websocket)
     except Exception as e:
-        loger.error(f"Exception: {e}")
+        logger.error(f"Exception: {e}")
         import traceback
         traceback.print_exc()
 
