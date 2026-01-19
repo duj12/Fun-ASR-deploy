@@ -205,6 +205,7 @@ if args.vllm_model_dir:
     model_asr_nano, kwargs_asr = AutoModel.build_model(
         model=args.asr_model, 
         trust_remote_code=True, 
+        # remote_code="./models/fun_asr_nano.py",
         device=args.device
     )
     asr_tokenizer, asr_frontend = kwargs_asr["tokenizer"], kwargs_asr["frontend"]
@@ -230,6 +231,8 @@ logger.info(f"Load VAD Model: {args.vad_model} ...")
 model_vad = AutoModel(
     model=args.vad_model,
     model_revision=args.vad_model_revision,
+    trust_remote_code=True, 
+    remote_code="./models/fsmn_vad_streaming.py",
     ngpu=args.ngpu,
     ncpu=args.ncpu,
     device=args.device,
