@@ -405,8 +405,8 @@ class FsmnVADStreaming(nn.Module):
             cache["stats"].output_data_buf[-1].doa = 0
         cur_seg = cache["stats"].output_data_buf[-1]
         if cur_seg.end_ms != start_frm * self.vad_opts.frame_in_ms:
-            pass
-            # print("warning\n")
+            # pass
+            print("warning, Something wrong with the VAD algorithm")
         data_to_pop = 0
         if end_point_is_sent_end:
             data_to_pop = expected_sample_number
@@ -420,9 +420,9 @@ class FsmnVADStreaming(nn.Module):
             expected_sample_number = len(cache["stats"].data_buf)
 
         cur_seg.doa = 0
-        if cur_seg.end_ms != start_frm * self.vad_opts.frame_in_ms:
-            pass
-            # print("Something wrong with the VAD algorithm\n")
+        # if cur_seg.end_ms != start_frm * self.vad_opts.frame_in_ms:
+        #     pass
+        #     print("Something wrong with the VAD algorithm\n")
         cache["stats"].data_buf_start_frame += frm_cnt
         cur_seg.end_ms = (start_frm + frm_cnt) * self.vad_opts.frame_in_ms
         if first_frm_is_start_point:
@@ -499,7 +499,8 @@ class FsmnVADStreaming(nn.Module):
         # for each frame, calc log posterior probability of each state
         if cur_decibel < self.vad_opts.decibel_thres:
             frame_state = FrameState.kFrameStateSil
-            self.DetectOneFrame(frame_state, t, False, cache=cache)
+            # ！！！注意，下面这行代码必须注释掉，不然会导致能量过滤掉的静音帧执行两次DetectOneFrame，从而多累计连续静音帧长度等问题
+            # self.DetectOneFrame(frame_state, t, False, cache=cache)
             return frame_state
 
         sum_score = 0.0
