@@ -35,11 +35,15 @@ inference_executor = ThreadPoolExecutor(max_workers=10)
 
 # vLLM 相关全局变量
 global vllm_engine, vllm_sampling_params, model_asr_nano, asr_tokenizer, asr_frontend
+global model_asr_streaming, model_vad, model_punc
 vllm_engine = None
 vllm_sampling_params = None
 model_asr_nano = None  # FunASRNano 模型实例或带 llm 的 ASR 模型
 asr_tokenizer = None
 asr_frontend = None
+model_asr_streaming = None
+model_vad = None
+model_punc = None
 
 # 语言代码到可读文本的映射（用于构造自然语言 prompt）
 LANG_TEXT_MAP = {
@@ -157,7 +161,7 @@ def get_args():
     parser.add_argument(
         "--vllm_gpu_memory_utilization",
         type=float,
-        default=0.1,
+        default=0.08,
         help="vLLM GPU 内存利用率 (0.0-1.0)",
     )
     parser.add_argument(
@@ -212,7 +216,6 @@ websocket_users = set()
 # session_id -> {"asr": {}, "asr_online": {"cache": {}, "is_final": False}, "vad": {"cache": {}, "is_final": False}, "punc": {"cache": {}}}
 session_states: Dict[str, Dict[str, Any]] = {}
 
-
 def new_session_state() -> Dict[str, Any]:
     return {
         "asr": {},
@@ -221,73 +224,11 @@ def new_session_state() -> Dict[str, Any]:
         "punc": {"cache": {}},
     }
 
-
 def get_state(sid) -> Dict[str, Any]:
     if sid not in session_states:
         state_dict = new_session_state()
         session_states[sid] = copy.deepcopy(state_dict)
     return session_states[sid]
-
-logger.info("Load model...")
-# ASR 模型 (离线/2pass + 在线/流式)
-logger.info(f"Load ASR Model: {args.asr_model} ...")
-if args.vllm_model_dir:
-    model_asr_nano, kwargs_asr = AutoModel.build_model(
-        model=args.asr_model, 
-        trust_remote_code=True, 
-        # remote_code="./models/fun_asr_nano.py",
-        device=args.device
-    )
-    asr_tokenizer, asr_frontend = kwargs_asr["tokenizer"], kwargs_asr["frontend"]
-else:
-    model_asr_nano = AutoModel(
-        model=args.asr_model,
-        model_revision=args.asr_model_revision,
-        ngpu=args.ngpu,
-        ncpu=args.ncpu,
-        device=args.device,
-        disable_pbar=True,
-        disable_log=True,
-        fp16=args.fp16,
-    )
-
-# ASR Streaming 模型
-logger.info(f"Load ASR Online Model: {args.asr_model_online} ...")
-model_asr_streaming = AutoModel(
-    model=args.asr_model_online, model_revision=args.asr_model_online_revision)
-
-# VAD 模型
-logger.info(f"Load VAD Model: {args.vad_model} ...")
-model_vad = AutoModel(
-    model=args.vad_model,
-    model_revision=args.vad_model_revision,
-    trust_remote_code=True, 
-    remote_code="./models/fsmn_vad_streaming.py",
-    ngpu=args.ngpu,
-    ncpu=args.ncpu,
-    device=args.device,
-    disable_pbar=True,
-    disable_log=True,
-    fp16=args.fp16,
-)
-
-# 标点模型
-if args.punc_model != "":
-    logger.info(f"Load Punc Model: {args.punc_model} ...")
-    model_punc = AutoModel(
-        model=args.punc_model,
-        model_revision=args.punc_model_revision,
-        ngpu=args.ngpu,
-        ncpu=args.ncpu,
-        device=args.device,
-        disable_pbar=True,
-        disable_log=True,
-        fp16=args.fp16,
-    )
-else:
-    model_punc = None
-
-logger.info("Load model finished.")  
 
 
 # 异步模型推理辅助函数
@@ -888,9 +829,70 @@ async def async_asr_online(websocket, audio_in, sid):
             logger.error(f"Client disconnected during async_asr empty send: {e}")
 
 async def main(): 
+    global model_asr_nano, model_asr_streaming, model_vad, model_punc, asr_tokenizer, asr_frontend
+    logger.info("Load model...")
+    # ASR 模型 (离线/2pass + 在线/流式)
+    logger.info(f"Load ASR Model: {args.asr_model} ...")
     if args.vllm_model_dir:
-        global vllm_engine, vllm_sampling_params
-        global asr_tokenizer, asr_frontend, prompt_prefix_embeddings, prompt_suffix_embeddings
+        model_asr_nano, kwargs_asr = AutoModel.build_model(
+            model=args.asr_model, 
+            trust_remote_code=True, 
+            # remote_code="./models/fun_asr_nano.py",
+            device=args.device
+        )
+        asr_tokenizer, asr_frontend = kwargs_asr["tokenizer"], kwargs_asr["frontend"]
+    else:
+        model_asr_nano = AutoModel(
+            model=args.asr_model,
+            model_revision=args.asr_model_revision,
+            ngpu=args.ngpu,
+            ncpu=args.ncpu,
+            device=args.device,
+            disable_pbar=True,
+            disable_log=True,
+            fp16=args.fp16,
+        )
+
+    # ASR Streaming 模型
+    logger.info(f"Load ASR Online Model: {args.asr_model_online} ...")
+    model_asr_streaming = AutoModel(
+        model=args.asr_model_online, model_revision=args.asr_model_online_revision)
+
+    # VAD 模型
+    logger.info(f"Load VAD Model: {args.vad_model} ...")
+    model_vad = AutoModel(
+        model=args.vad_model,
+        model_revision=args.vad_model_revision,
+        trust_remote_code=True, 
+        remote_code="./models/fsmn_vad_streaming.py",
+        ngpu=args.ngpu,
+        ncpu=args.ncpu,
+        device=args.device,
+        disable_pbar=True,
+        disable_log=True,
+        fp16=args.fp16,
+    )
+
+    # 标点模型
+    if args.punc_model != "":
+        logger.info(f"Load Punc Model: {args.punc_model} ...")
+        model_punc = AutoModel(
+            model=args.punc_model,
+            model_revision=args.punc_model_revision,
+            ngpu=args.ngpu,
+            ncpu=args.ncpu,
+            device=args.device,
+            disable_pbar=True,
+            disable_log=True,
+            fp16=args.fp16,
+        )
+    else:
+        model_punc = None
+
+    logger.info("Load model finished.")  
+
+    if args.vllm_model_dir:
+        global vllm_engine, vllm_sampling_params, prompt_prefix_embeddings, prompt_suffix_embeddings
         logger.info(f"Initializing vLLM engine from {args.vllm_model_dir}...")
         try:
             from vllm import LLM, SamplingParams
@@ -901,6 +903,7 @@ async def main():
             else:
                 # 初始化 vLLM
                 os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+                os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
                 cudagraph_sizes = [x for x in range(1, args.vllm_max_num_seqs + 1)]
                 
                 vllm_engine = LLM(
@@ -913,6 +916,7 @@ async def main():
                     ),
                     tensor_parallel_size=1,
                     max_num_seqs=args.vllm_max_num_seqs,
+                    max_model_len=2048,               # 限制单个序列长度
                     max_num_batched_tokens=1024,      # 减少批处理token数
                     trust_remote_code=True,
                 )
