@@ -5,7 +5,4 @@ modelscope
 transformers
 sentencepiece
 websockets
-# vLLM 相关依赖（可选，用于提升并发性能）
-# vllm>=0.13.0  # 如果需要使用 vLLM 异步推理，请取消注释并安装
-# 注意：vLLM 安装可能需要特定的 CUDA 版本和编译环境
-# 安装命令: pip install vllm 或参考 https://docs.vllm.ai/en/latest/getting_started/installation.html
+vllm==0.13.0

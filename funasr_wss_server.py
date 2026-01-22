@@ -2,7 +2,7 @@
 import asyncio
 import json
 import websockets
-import time
+import copy
 import logging
 import argparse
 import ssl
@@ -111,7 +111,7 @@ def get_args():
     parser.add_argument(
         "--asr_model_online",
         type=str,
-        default="paraformer-zh-streaming",
+        default="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
         help="流式 ASR 模型名称 (从 ModelScope 下载)",
     )
     parser.add_argument("--asr_model_online_revision", type=str, default='v2.0.4', help="模型版本")
@@ -151,13 +151,13 @@ def get_args():
     parser.add_argument(
         "--vllm_model_dir",
         type=str,
-        default=None,
+        default="checkpoints/yuekai/Fun-ASR-Nano-2512-vllm",
         help="vLLM 模型目录路径，如果提供则使用 vLLM 进行异步推理",
     )
     parser.add_argument(
         "--vllm_gpu_memory_utilization",
         type=float,
-        default=0.3,
+        default=0.1,
         help="vLLM GPU 内存利用率 (0.0-1.0)",
     )
     parser.add_argument(
@@ -181,6 +181,31 @@ def get_args():
     return parser.parse_args()
 
 args = get_args()
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+checkpoint_dir = os.path.join(ROOT_DIR, "checkpoints")
+asr_model_dir = os.path.join(checkpoint_dir, args.asr_model)
+if not os.path.exists(asr_model_dir):
+    raise FileNotFoundError(f"{asr_model_dir} 模型不存在")
+else:
+    args.asr_model = asr_model_dir
+asr_model_online_dir = os.path.join(checkpoint_dir, args.asr_model_online)
+if not os.path.exists(asr_model_online_dir):
+    raise FileNotFoundError(f"{asr_model_online_dir} 模型不存在")
+else:
+    args.asr_model_online = asr_model_online_dir
+vad_model_dir = os.path.join(checkpoint_dir, args.vad_model)
+if not os.path.exists(vad_model_dir):
+    raise FileNotFoundError(f"{vad_model_dir} 模型不存在")
+else:
+    args.vad_model = vad_model_dir
+if args.punc_model:
+    punc_model_dir = os.path.join(checkpoint_dir, args.punc_model)
+    if not os.path.exists(punc_model_dir):
+        raise FileNotFoundError(f"{punc_model_dir} 模型不存在")
+    else:
+        args.punc_model = punc_model_dir
+
+
 websocket_users = set()
 
 # 连接级别状态（按 uuid 隔离，避免不同连接 cache/参数互相干扰）
@@ -197,18 +222,10 @@ def new_session_state() -> Dict[str, Any]:
     }
 
 
-def get_session_id(websocket) -> str:
-    sid = getattr(websocket, "session_id", None)
-    if sid is None:
-        sid = str(uuid.uuid4())
-        websocket.session_id = sid
-    return sid
-
-
-def get_state(websocket) -> Dict[str, Any]:
-    sid = get_session_id(websocket)
+def get_state(sid) -> Dict[str, Any]:
     if sid not in session_states:
-        session_states[sid] = new_session_state()
+        state_dict = new_session_state()
+        session_states[sid] = copy.deepcopy(state_dict)
     return session_states[sid]
 
 logger.info("Load model...")
@@ -294,7 +311,7 @@ async def run_model_inference(model, input, **kwargs):
     )
 
 
-async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, **kwargs):
+async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwargs):
     """
     使用 vLLM 进行异步 ASR 推理（适用于离线/2pass ASR）。
     结合 itn / hotwords / language 动态构造 prompt，并计算 embeddings 后再 generate。
@@ -315,7 +332,7 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, **kwargs):
         return await run_model_inference(model_asr_nano, [audio_tensor], **kwargs)
 
     # 1. 从 websocket / kwargs 里拿到 itn / hotwords / language 参数
-    state = get_state(websocket)
+    state = get_state(sid)
     itn = kwargs.get("itn", state['asr'].get("itn", True))
     hotwords = kwargs.get("hotwords", state['asr'].get("hotwords", []))
     language_code = kwargs.get("language", state['asr'].get("language", None))
@@ -475,12 +492,11 @@ def decode_audio_chunk(chunk_bytes):
     return torch.from_numpy(data_float32)
 
 
-async def ws_reset(websocket):
+async def ws_reset(websocket, sid=None):
     """
     重置 WebSocket 连接对应的状态缓存。
     当连接断开及为了安全起见清理内存时调用。
     """
-    sid = getattr(websocket, "session_id", None)
     logger.info(f"ws reset now, total num is: {len(websocket_users)}, session_id={sid}")
 
     # 清理该连接的状态缓存
@@ -516,20 +532,21 @@ async def ws_serve(websocket, path=None):
     frames_asr = [] # 离线 ASR 缓冲区 (由 VAD 分割)
     frames_asr_online = [] # 在线流式 ASR 缓冲区
     
-    
+    websocket.send_lock = asyncio.Lock()
     global websocket_users
     websocket_users.add(websocket)
 
     # 为每个连接生成 uuid，并初始化/获取该连接的隔离状态
-    sid = get_session_id(websocket)
-    state = get_state(websocket)
+    sid = str(uuid.uuid4())
+    state = get_state(sid)
     
-    websocket.chunk_interval = 10
-    websocket.vad_pre_idx = 0
+    state["chunk_interval"] = 10
+    state["vad_pre_idx"] = 0
     speech_start = False
     speech_end_i = -1
-    websocket.wav_name = "microphone"
-    websocket.mode = "2pass"
+    state["wav_name"] = "microphone"
+    state["mode"] = "2pass"
+    state["is_speaking"] = True
     
     logger.info(f"new user connected, session_id={sid}")
 
@@ -539,13 +556,14 @@ async def ws_serve(websocket, path=None):
                 try:
                     messagejson = json.loads(message)
                     logger.info({"session_id": sid, **messagejson})
+                    # logger.info(f"state: {state}")
                     if "is_speaking" in messagejson:
-                        websocket.is_speaking = messagejson["is_speaking"]
-                        state["asr_online"]["is_final"] = not websocket.is_speaking
+                        state["is_speaking"] = messagejson["is_speaking"]
+                        state["asr_online"]["is_final"] = not state["is_speaking"]
                     if "chunk_interval" in messagejson:
-                        websocket.chunk_interval = messagejson["chunk_interval"]
+                        state["chunk_interval"] = messagejson["chunk_interval"]
                     if "wav_name" in messagejson:
-                        websocket.wav_name = messagejson.get("wav_name")
+                        state["wav_name"] = messagejson.get("wav_name")
                     if "chunk_size" in messagejson:
                         chunk_size = messagejson["chunk_size"]
                         if isinstance(chunk_size, str):
@@ -578,16 +596,16 @@ async def ws_serve(websocket, path=None):
                     if "vad_energy" in messagejson:
                         state["vad"]["decibel_thres"] = messagejson["vad_energy"]
                     if "mode" in messagejson:
-                        websocket.mode = messagejson["mode"]
-                        # if websocket.mode == "online":
-                        #     websocket.mode = "2pass"
+                        state["mode"] = messagejson["mode"]
+                        # if state["mode"] == "online":
+                        #     state["mode"] = "2pass"
                 except Exception as e:
                     print("JSON error:", e)
 
             # 确保 VAD 的分块大小正确计算
             if "chunk_size" in state["asr_online"]:
                  state["vad"]["chunk_size"] = int(
-                    state["asr_online"]["chunk_size"][1] * 60 / websocket.chunk_interval
+                    state["asr_online"]["chunk_size"][1] * 60 / state["chunk_interval"]
                 )
             
             # 处理音频数据
@@ -596,23 +614,22 @@ async def ws_serve(websocket, path=None):
                     # 收到的是音频块
                     frames.append(message)
                     duration_ms = len(message) // 32 # 16k rate, 16bit = 2 bytes. 1ms = 16 samples = 32 bytes
-                    websocket.vad_pre_idx += duration_ms
+                    state["vad_pre_idx"] += duration_ms
 
                     # 1. 送入在线流式 ASR (Online ASR)
                     frames_asr_online.append(message)
                     state["asr_online"]["is_final"] = speech_end_i != -1
                     
                     # 根据 chunk 间隔或语音结束信号触发在线推理
-                    if (len(frames_asr_online) % websocket.chunk_interval == 0 
+                    if (len(frames_asr_online) % state["chunk_interval"] == 0 
                         or state["asr_online"]["is_final"]):
                         
-                        if websocket.mode == "2pass" or websocket.mode == "online":
+                        if state["mode"] == "2pass" or state["mode"] == "online":
                             audio_in = b"".join(frames_asr_online)
                             try:
-                                await async_asr_online(websocket, audio_in)
+                                await async_asr_online(websocket, audio_in, sid)
                             except Exception as e:
                                 print(f"error in asr streaming: {e}")
-                                import traceback
                                 traceback.print_exc()
                         
                         frames_asr_online = [] # 清空在线缓冲区
@@ -622,7 +639,7 @@ async def ws_serve(websocket, path=None):
                         frames_asr.append(message) # 收集用于离线识别的音频
                     
                     try:
-                        speech_start_i, speech_end_i = await async_vad(websocket, message)
+                        speech_start_i, speech_end_i = await async_vad(websocket, message, sid)
                     except Exception as e:
                         logger.error(f"error in vad: {e}")
                         speech_start_i, speech_end_i = -1, -1
@@ -631,28 +648,26 @@ async def ws_serve(websocket, path=None):
                     if speech_start_i != -1:
                         speech_start = True
                         # 回溯音频池，捕获语音起始段
-                        beg_bias = (websocket.vad_pre_idx - speech_start_i) // duration_ms
+                        beg_bias = (state["vad_pre_idx"] - speech_start_i) // duration_ms
                         frames_pre = frames[-beg_bias:]
                         frames_asr = []
                         frames_asr.extend(frames_pre)
                 
                 # 3. 处理语音结束或流结束 -> 触发离线 ASR + 标点恢复
-                if speech_end_i != -1 or not websocket.is_speaking:
-                    if websocket.mode == "2pass" or websocket.mode == "offline":
+                if speech_end_i != -1 or not state["is_speaking"]:
+                    if state["mode"] == "2pass" or state["mode"] == "offline":
                         audio_in = b"".join(frames_asr)
                         try:
-                            await async_asr(websocket, audio_in)
+                            await async_asr(websocket, audio_in, sid)
                         except Exception as e:
                             logger.error(f"error in asr offline: {e}")
-                            import traceback
                             traceback.print_exc()
                     else:  # online only
                         audio_in = b""
                         try:
-                            await async_asr_online(websocket, audio_in)
+                            await async_asr_online(websocket, audio_in, sid)
                         except Exception as e:
                             logger.error(f"error in asr offline: {e}")
-                            import traceback
                             traceback.print_exc()
                         
                     
@@ -662,8 +677,8 @@ async def ws_serve(websocket, path=None):
                     frames_asr_online = []
                     state["asr_online"]["cache"] = {}
                     
-                    if not websocket.is_speaking:
-                        websocket.vad_pre_idx = 0
+                    if not state["is_speaking"]:
+                        state["vad_pre_idx"] = 0
                         frames = []
                         state["vad"]["cache"] = {}
                     else:
@@ -675,16 +690,15 @@ async def ws_serve(websocket, path=None):
 
     except websockets.ConnectionClosed:
         logger.error(f"连接已关闭。{websocket_users}")
-        await ws_reset(websocket)
+        await ws_reset(websocket, sid)
         if websocket in websocket_users:
             websocket_users.remove(websocket)
     except Exception as e:
         logger.error(f"Exception: {e}")
-        import traceback
         traceback.print_exc()
 
 
-async def async_vad(websocket, audio_in):
+async def async_vad(websocket, audio_in, sid):
     """
     异步 VAD (语音活动检测) 处理函数。
     检测输入音频中是否包含人声，并返回语音片段的起止时间。
@@ -701,7 +715,7 @@ async def async_vad(websocket, audio_in):
     audio_tensor = decode_audio_chunk(audio_in)
     # 异步并发调用 VAD 模型
     # 注意：这里我们依旧要遵守 Nano 模型的规则（虽然是 VAD，但保持输入格式一致比较安全），传入 list
-    state = get_state(websocket)
+    state = get_state(sid)
     segments_result_list = await run_model_inference(
         model_vad, input=[audio_tensor], **state["vad"]
     )
@@ -720,7 +734,7 @@ async def async_vad(websocket, audio_in):
     return speech_start, speech_end
 
 
-async def async_asr(websocket, audio_in):
+async def async_asr(websocket, audio_in, sid):
     """
     异步离线 ASR (2pass-offline) 处理函数。
     对完整的语音片段进行高精度识别，通常在 VAD 检测到语音结束时调用。
@@ -733,15 +747,15 @@ async def async_asr(websocket, audio_in):
         audio_in (bytes): 完整的语音片段字节流
     """
     # 离线识别 (最终修正)
+    state = get_state(sid)
     if len(audio_in) > 0:
         audio_tensor = decode_audio_chunk(audio_in)
         
         # 优先使用 vLLM 进行推理（如果可用）
-        state = get_state(websocket)
         if vllm_engine is not None and model_asr_nano is not None:
             try:
                 rec_result_list = await async_asr_with_vllm(
-                    audio_tensor, websocket, **state["asr"]
+                    audio_tensor, websocket, sid, **state["asr"]
                 )
             except Exception as e:
                 logger.warning(f"vLLM 推理失败，回退到传统方式: {e}")
@@ -763,11 +777,10 @@ async def async_asr(websocket, audio_in):
         
         text = rec_result['text']
         if len(text)>0:
-            logger.info(f"2pass-offline: {text}" )
+            logger.info(f"2pass-offline, sid={sid}, name={state['wav_name']}: {text}" )
         # 标点恢复
         if model_punc is not None and len(rec_result["text"]) > 0:
             # 异步并发调用标点模型
-            state = get_state(websocket)
             punc_result_list = await run_model_inference(
                 model_punc, input=rec_result["text"], **state["punc"]
             )
@@ -775,38 +788,40 @@ async def async_asr(websocket, audio_in):
                 rec_result = punc_result_list[0]
         
         # 始终发送结果，即使为空，否则客户端会一直等待直到超时
-        mode = "2pass-offline" if "2pass" in websocket.mode else websocket.mode
+        mode = "2pass-offline" if "2pass" in state["mode"] else state["mode"]
         message = json.dumps(
             {
                 "mode": mode,
                 "text": rec_result["text"],
-                "wav_name": websocket.wav_name,
-                "is_final": not websocket.is_speaking,
+                "wav_name": state["wav_name"],
+                "is_final": not state["is_speaking"],
             }
         )
         try:
-            await websocket.send(message)
+            async with websocket.send_lock:
+                await websocket.send(message)
         except Exception as e:
             # 客户端断开，安全忽略
             logger.error(f"Client disconnected during async_asr send: {e}")
     else:
         # Empty audio result
-        mode = "2pass-offline" if "2pass" in websocket.mode else websocket.mode
+        mode = "2pass-offline" if "2pass" in state["mode"] else state["mode"]
         message = json.dumps(
             {
                 "mode": mode,
                 "text": "",
-                "wav_name": websocket.wav_name,
-                "is_final": not websocket.is_speaking,
+                "wav_name": state["wav_name"],
+                "is_final": not state["is_speaking"],
             }
         )
         try:
-            await websocket.send(message)
+            async with websocket.send_lock:
+                await websocket.send(message)
         except Exception as e:
             logger.error(f"Client disconnected during async_asr empty send: {e}")
 
 
-async def async_asr_online(websocket, audio_in):
+async def async_asr_online(websocket, audio_in, sid):
     """
     异步在线流式 ASR (Online Streaming) 处理函数。
     对实时到达的音频流进行增量识别，返回中间结果 (is_final=False)。
@@ -820,9 +835,9 @@ async def async_asr_online(websocket, audio_in):
     # 在线流式识别
     # 注意：流式 ASR 通常不使用 vLLM，因为需要实时性
     # vLLM 更适合离线/2pass ASR 的批量处理
+    state = get_state(sid)
     if len(audio_in) > 0:
         audio_tensor = decode_audio_chunk(audio_in)
-        state = get_state(websocket)
         # 异步并发调用流式 ASR 模型
         # 使用 run_model_inference 确保不阻塞事件循环
         try:
@@ -839,17 +854,17 @@ async def async_asr_online(websocket, audio_in):
         text = rec_result['text']
         if len(text)>0:
             logger.info(f"2pass-online: {text}" )
-        if websocket.mode == "2pass" and state["asr_online"].get("is_final", False):
+        if state["mode"] == "2pass" and state["asr_online"].get("is_final", False):
             return
 
         if len(rec_result["text"]):
-            mode = "2pass-online" if "2pass" in websocket.mode else websocket.mode
+            mode = "2pass-online" if "2pass" in state["mode"] else state["mode"]
             message = json.dumps(
                 {
                     "mode": mode,
                     "text": rec_result["text"],
-                    "wav_name": websocket.wav_name,
-                    "is_final": not websocket.is_speaking,
+                    "wav_name": state["wav_name"],
+                    "is_final": not state["is_speaking"],
                 }
             )
             try:
@@ -858,13 +873,13 @@ async def async_asr_online(websocket, audio_in):
                 logger.error(f"Client disconnected during async_asr_online send: {e}")
     else:
         # Empty audio result
-        mode = "2pass-online" if "2pass" in websocket.mode else websocket.mode
+        mode = "2pass-online" if "2pass" in state["mode"] else state["mode"]
         message = json.dumps(
             {
                 "mode": mode,
                 "text": "",
-                "wav_name": websocket.wav_name,
-                "is_final": not websocket.is_speaking,
+                "wav_name": state["wav_name"],
+                "is_final": not state["is_speaking"],
             }
         )
         try:
@@ -898,6 +913,7 @@ async def main():
                     ),
                     tensor_parallel_size=1,
                     max_num_seqs=args.vllm_max_num_seqs,
+                    max_num_batched_tokens=1024,      # 减少批处理token数
                     trust_remote_code=True,
                 )
                 
@@ -923,7 +939,6 @@ async def main():
             logger.warning("vLLM 未安装，将使用传统推理方式。安装命令: pip install vllm")
         except Exception as e:
             logger.error(f"初始化 vLLM 失败: {e}")
-            import traceback
             traceback.print_exc()
    
     if len(args.certfile) > 0:

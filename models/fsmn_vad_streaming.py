@@ -625,7 +625,7 @@ class FsmnVADStreaming(nn.Module):
         cache["frontend"] = {}
         cache["prev_samples"] = torch.empty(0)
         cache["encoder"] = {}
-        print(f"vad kwargs: {kwargs}")
+        # print(f"vad kwargs: {kwargs}")
         if kwargs.get("max_end_silence_time") is not None:
             # update the max_end_silence_time
             self.vad_opts.max_end_silence_time = kwargs.get("max_end_silence_time")

@@ -1,34 +1,14 @@
 ## 启动服务
 
-### 基础启动（不使用 vLLM）
-
 ```python
 python ./funasr_wss_server.py
 ```
-
-### 使用 vLLM 提升并发性能（推荐）
-
-vLLM 提供了高效的异步推理接口，可以显著提升高并发场景下的性能。
-
-```python
-python ./funasr_wss_server.py \
-    --vllm_model_dir /path/to/vllm/model \
-    --vllm_gpu_memory_utilization 0.3 \
-    --vllm_max_num_seqs 16
-```
-
-**参数说明：**
-- `--vllm_model_dir`: vLLM 模型目录路径（需要与 ASR 模型匹配）
-- `--vllm_gpu_memory_utilization`: GPU 内存利用率 (0.0-1.0)，默认 0.3
-- `--vllm_max_num_seqs`: 最大并发序列数，默认 16
-- `--asr_batch_size`: 离线 ASR 批量处理大小，默认 4
-- `--asr_batch_timeout`: 批量处理超时时间（秒），默认 0.05
 
 **注意事项：**
 1. vLLM 需要安装：`pip install vllm>=0.13.0`
 2. vLLM 仅支持 FunASRNano 类型的 ASR 模型
 3. 如果 vLLM 初始化失败，系统会自动回退到传统推理方式
-4. vLLM 主要用于离线/2pass ASR，流式 ASR 仍使用传统方式以保证实时性
+4. vLLM 主要用于离线/2pass ASR，流式ASR仍使用传统方式以保证实时性
 
 ## 客户端连接
 
