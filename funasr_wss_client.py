@@ -352,6 +352,9 @@ async def message(id):
                 print("\rpid" + str(id) + ": " + text_print)
                 
             if meg["is_final"]:
+                print(f"Received final result for {wav_name}, closing connection...")
+                # await asyncio.sleep(3)
+                await websocket.close()
                 break
 
     except Exception as e:

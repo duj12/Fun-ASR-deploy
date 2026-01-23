@@ -325,11 +325,13 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwar
         outputs = vllm_engine.generate(
             [{"prompt_embeds": input_embedding}],
             vllm_sampling_params,
+            # request_id=sid,
             use_tqdm=False,
         )
         return outputs[0].outputs[0].text
 
-    text = await loop.run_in_executor(inference_executor, vllm_generate)
+    # text = await loop.run_in_executor(inference_executor, vllm_generate)
+    text = vllm_generate()
     return [{"text": text}]
 
 
@@ -489,7 +491,7 @@ async def ws_serve(websocket, path=None):
     state["mode"] = "2pass"
     state["is_speaking"] = True
     
-    logger.info(f"new user connected, session_id={sid}")
+    logger.info(f"new user connected, session_id={sid}. Current total num is: {len(websocket_users)}")
 
     try:
         async for message in websocket:
@@ -629,11 +631,11 @@ async def ws_serve(websocket, path=None):
                     # 如果当前轮结束（is_speaking=False），等待客户端关闭后再清理 session cache
                     # 这里不主动 close，让客户端逻辑决定；连接关闭会触发 ws_reset 进行最终清理
 
-    except websockets.ConnectionClosed:
-        logger.error(f"连接已关闭。{websocket_users}")
-        await ws_reset(websocket, sid)
-        if websocket in websocket_users:
-            websocket_users.remove(websocket)
+        if websocket.closed:
+            await ws_reset(websocket, sid)
+            if websocket in websocket_users:
+                websocket_users.remove(websocket)
+            logger.info(f"sid: {sid} 连接已关闭。Current websocket_users: {len(websocket_users)}")
     except Exception as e:
         logger.error(f"Exception: {e}")
         traceback.print_exc()
