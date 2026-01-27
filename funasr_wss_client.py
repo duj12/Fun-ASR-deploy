@@ -80,7 +80,7 @@ parser.add_argument("--vad_max_len",
 
 parser.add_argument("--vad_energy",
                     type=int,
-                    default=-35,
+                    default=-100,
                     help="energy threshold for VAD, in Decibel (dB). better be [-100, -10] negative number."
                     "if the energy of a audio frame is lower than this value, this frame will be judged as silence.")
 

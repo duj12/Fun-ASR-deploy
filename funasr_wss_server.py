@@ -90,10 +90,6 @@ def build_prompt(hotwords, language_code, itn):
     prompt += "："
     return prompt
 
-# 异步推理队列，用于批量处理离线 ASR 请求
-asr_request_queue = deque()
-asr_batch_processing_task = None
-asr_batch_semaphore = asyncio.Semaphore(1)  # 控制批量处理并发
 
 def get_args():
     """
@@ -170,18 +166,7 @@ def get_args():
         default=16,
         help="vLLM 最大并发序列数",
     )
-    parser.add_argument(
-        "--asr_batch_size",
-        type=int,
-        default=4,
-        help="离线 ASR 批量处理大小",
-    )
-    parser.add_argument(
-        "--asr_batch_timeout",
-        type=float,
-        default=0.05,
-        help="离线 ASR 批量处理超时时间（秒）",
-    )
+
     return parser.parse_args()
 
 args = get_args()
@@ -320,101 +305,29 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwar
     # 在线程池中做编码，避免阻塞事件循环
     input_embedding = await loop.run_in_executor(inference_executor, encode_audio_and_prompt)
 
-    # 3. 调用 vLLM generate，同样放在线程池中
-    def vllm_generate():
-        outputs = vllm_engine.generate(
-            [{"prompt_embeds": input_embedding}],
+    # 3. 调用 vLLM generate
+    async def vllm_generate():
+        from vllm.sampling_params import RequestOutputKind
+        # 设置为返回完整输出而非流式输出
+        vllm_sampling_params.output_kind = RequestOutputKind.FINAL_ONLY         
+        # 收集所有生成的文本
+        full_text = ""
+        async for outputs in vllm_engine.generate(
+            {"prompt_embeds": input_embedding},
             vllm_sampling_params,
-            # request_id=sid,
-            use_tqdm=False,
-        )
-        return outputs[0].outputs[0].text
+            request_id=sid,
+            use_tqdm=True,
+        ):
+            # 累积每次生成的文本
+            if outputs.outputs:
+                full_text = outputs.outputs[0].text
+
+        return full_text
 
     # text = await loop.run_in_executor(inference_executor, vllm_generate)
-    text = vllm_generate()
+    text = await vllm_generate()
     return [{"text": text}]
 
-
-async def async_asr_batch_with_vllm(audio_tensors: List[torch.Tensor], **kwargs):
-    """
-    使用 vLLM 进行批量异步 ASR 推理。
-    这个方法可以同时处理多个音频，提升吞吐量。
-    
-    Args:
-        audio_tensors: 音频张量列表
-        **kwargs: 额外的推理参数
-    
-    Returns:
-        识别结果列表
-    """
-    global vllm_engine, vllm_sampling_params, model_asr_nano
-    global asr_tokenizer, asr_frontend
-    
-    if vllm_engine is None or model_asr_nano is None or asr_tokenizer is None or asr_frontend is None:
-        # 回退到传统推理方式
-        results = []
-        for audio_tensor in audio_tensors:
-            result = await run_model_inference(model_asr_nano, [audio_tensor], **kwargs)
-            results.append(result[0] if result else {"text": ""})
-        return results
-    
-    loop = asyncio.get_running_loop()
-    device = next(model_asr_nano.parameters()).device
-
-    # 这里为了简单：对整个 batch 使用同一套 itn/hotwords/language，可根据需要扩展为逐条不同
-    itn = kwargs.get("itn", True)
-    hotwords = kwargs.get("hotwords", [])
-    language_code = kwargs.get("language", None)
-    prompt = build_prompt(hotwords, language_code, itn)
-
-    def encode_audio_batch():
-        input_embeddings_list = []
-
-        # 构造统一的文字 prompt embeddings
-        instruction_prompt = (
-            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n{prompt}"
-        )
-        prompt_suffix = "<|im_end|>\n<|im_start|>assistant\n"
-        prefix_ids = asr_tokenizer.encode(instruction_prompt)
-        suffix_ids = asr_tokenizer.encode(prompt_suffix)
-        emb_layer = model_asr_nano.llm.model.get_input_embeddings()
-        prefix_emb = emb_layer(torch.tensor(prefix_ids, dtype=torch.int64, device=device))
-        suffix_emb = emb_layer(torch.tensor(suffix_ids, dtype=torch.int64, device=device))
-
-        for audio_tensor in audio_tensors:
-            # 提取特征
-            speech, speech_lengths = extract_fbank(
-                [audio_tensor],
-                frontend=asr_frontend,
-                is_final=True,
-            )
-            speech = speech.to(device)
-            speech_lengths = speech_lengths.to(device)
-
-            # 音频编码
-            encoder_out, encoder_out_lens = model_asr_nano.audio_encoder(speech, speech_lengths)
-            encoder_out, encoder_out_lens = model_asr_nano.audio_adaptor(encoder_out, encoder_out_lens)
-
-            # 构建输入 embeddings: prefix + speech_emb + suffix
-            speech_emb = encoder_out[0, :encoder_out_lens[0], :]
-            input_embedding = torch.cat([prefix_emb, speech_emb, suffix_emb], dim=0)
-            input_embeddings_list.append(input_embedding)
-
-        return input_embeddings_list
-
-    input_embeddings_list = await loop.run_in_executor(inference_executor, encode_audio_batch)
-
-    def vllm_generate_batch():
-        outputs = vllm_engine.generate(
-            [{"prompt_embeds": emb} for emb in input_embeddings_list],
-            vllm_sampling_params,
-            use_tqdm=False,
-        )
-        return [output.outputs[0].text for output in outputs]
-
-    texts = await loop.run_in_executor(inference_executor, vllm_generate_batch)
-    return [{"text": text} for text in texts]
 
 def decode_audio_chunk(chunk_bytes):
     """
@@ -897,7 +810,7 @@ async def main():
         global vllm_engine, vllm_sampling_params, prompt_prefix_embeddings, prompt_suffix_embeddings
         logger.info(f"Initializing vLLM engine from {args.vllm_model_dir}...")
         try:
-            from vllm import LLM, SamplingParams
+            from vllm import LLM, SamplingParams, AsyncLLMEngine, AsyncEngineArgs
             from vllm.config import CompilationConfig  
             
             if asr_tokenizer is None or asr_frontend is None:
@@ -908,21 +821,35 @@ async def main():
                 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
                 cudagraph_sizes = [x for x in range(1, args.vllm_max_num_seqs + 1)]
                 
-                vllm_engine = LLM(
+                # vllm_engine = LLM(
+                #     model=args.vllm_model_dir,
+                #     enable_prompt_embeds=True,
+                #     gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                #     dtype="bfloat16",
+                #     compilation_config=CompilationConfig(
+                #         cudagraph_capture_sizes=cudagraph_sizes
+                #     ),
+                #     tensor_parallel_size=1,
+                #     max_num_seqs=args.vllm_max_num_seqs,
+                #     max_model_len=2048,               # 限制单个序列长度
+                #     max_num_batched_tokens=1024,      # 减少批处理token数
+                #     trust_remote_code=True,
+                # )
+                engine_args = AsyncEngineArgs(
                     model=args.vllm_model_dir,
                     enable_prompt_embeds=True,
+                    disable_custom_all_reduce=True,
                     gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                     dtype="bfloat16",
                     compilation_config=CompilationConfig(
-                        cudagraph_capture_sizes=cudagraph_sizes
-                    ),
+                        cudagraph_capture_sizes=cudagraph_sizes),
                     tensor_parallel_size=1,
                     max_num_seqs=args.vllm_max_num_seqs,
                     max_model_len=2048,               # 限制单个序列长度
                     max_num_batched_tokens=1024,      # 减少批处理token数
                     trust_remote_code=True,
                 )
-                
+                vllm_engine = AsyncLLMEngine.from_engine_args(engine_args)      
                 vllm_sampling_params = SamplingParams(
                     top_p=0.001,
                     max_tokens=500,
