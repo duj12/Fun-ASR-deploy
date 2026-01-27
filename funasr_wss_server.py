@@ -11,8 +11,6 @@ import numpy as np
 import torch
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from collections import deque
 from typing import Optional, List, Dict, Any
 # 需要引下这个，不然会报错AssertionError: FunASRNano is not registered
 # issue见：https://github.com/modelscope/FunASR/issues/2741
@@ -28,10 +26,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
-
-# 全局线程池，用于并发执行模型推理，避免阻塞 asyncio 事件循环
-# 建议设置为预期的最大并发数，例如 10
-inference_executor = ThreadPoolExecutor(max_workers=10)
 
 # vLLM 相关全局变量
 global vllm_engine, vllm_sampling_params, model_asr_nano, asr_tokenizer, asr_frontend
@@ -219,7 +213,6 @@ def get_state(sid) -> Dict[str, Any]:
 # 异步模型推理辅助函数
 async def run_model_inference(model, input, **kwargs):
     """
-    在线程池中运行模型推理，避免阻塞 asyncio 主事件循环。
     
     Args:
         model: FunASR 模型实例
@@ -228,13 +221,8 @@ async def run_model_inference(model, input, **kwargs):
     
     Returns:
         推理结果
-    """
-    loop = asyncio.get_running_loop()
-    # 使用线程池执行同步的 blocking generate 方法
-    return await loop.run_in_executor(
-        inference_executor, 
-        lambda: model.generate(input=input, **kwargs)
-    )
+    """   
+    return model.generate(input=input, **kwargs)
 
 
 async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwargs):
@@ -269,7 +257,7 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwar
     loop = asyncio.get_running_loop()
     device = next(model_asr_nano.parameters()).device
 
-    def encode_audio_and_prompt():
+    async def encode_audio_and_prompt():
         # 2.1 特征提取
         speech, speech_lengths = extract_fbank(
             [audio_tensor],
@@ -302,8 +290,7 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwar
         input_embedding = torch.cat([prefix_emb, speech_emb, suffix_emb], dim=0)
         return input_embedding
 
-    # 在线程池中做编码，避免阻塞事件循环
-    input_embedding = await loop.run_in_executor(inference_executor, encode_audio_and_prompt)
+    input_embedding = await encode_audio_and_prompt()
 
     # 3. 调用 vLLM generate
     async def vllm_generate():
@@ -316,7 +303,6 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwar
             {"prompt_embeds": input_embedding},
             vllm_sampling_params,
             request_id=sid,
-            use_tqdm=True,
         ):
             # 累积每次生成的文本
             if outputs.outputs:
@@ -324,7 +310,6 @@ async def async_asr_with_vllm(audio_tensor: torch.Tensor, websocket, sid, **kwar
 
         return full_text
 
-    # text = await loop.run_in_executor(inference_executor, vllm_generate)
     text = await vllm_generate()
     return [{"text": text}]
 
@@ -809,7 +794,8 @@ async def main():
     if args.vllm_model_dir:
         global vllm_engine, vllm_sampling_params, prompt_prefix_embeddings, prompt_suffix_embeddings
         logger.info(f"Initializing vLLM engine from {args.vllm_model_dir}...")
-        try:
+        try:            
+            os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
             from vllm import LLM, SamplingParams, AsyncLLMEngine, AsyncEngineArgs
             from vllm.config import CompilationConfig  
             
@@ -820,21 +806,7 @@ async def main():
                 os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
                 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
                 cudagraph_sizes = [x for x in range(1, args.vllm_max_num_seqs + 1)]
-                
-                # vllm_engine = LLM(
-                #     model=args.vllm_model_dir,
-                #     enable_prompt_embeds=True,
-                #     gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-                #     dtype="bfloat16",
-                #     compilation_config=CompilationConfig(
-                #         cudagraph_capture_sizes=cudagraph_sizes
-                #     ),
-                #     tensor_parallel_size=1,
-                #     max_num_seqs=args.vllm_max_num_seqs,
-                #     max_model_len=2048,               # 限制单个序列长度
-                #     max_num_batched_tokens=1024,      # 减少批处理token数
-                #     trust_remote_code=True,
-                # )
+
                 engine_args = AsyncEngineArgs(
                     model=args.vllm_model_dir,
                     enable_prompt_embeds=True,
