@@ -766,7 +766,13 @@ async def main():
     model_asr_streaming = AutoModel(
         model=args.asr_model_online, 
         model_revision=args.asr_model_online_revision,
+        ngpu=args.ngpu,
+        ncpu=args.ncpu,
+        device=args.device,
+        disable_pbar=True,
+        disable_log=True,
         disable_update=True,
+        fp16=args.fp16,
     )
 
     # VAD 模型
