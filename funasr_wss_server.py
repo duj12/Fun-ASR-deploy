@@ -22,10 +22,11 @@ from torch.nn.utils.rnn import pad_sequence
 logging.root.handlers = []  # 清空modelscope修改后的handlers
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s.%(msecs)03d] %(process)d %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
+    format="[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
+
 
 # vLLM 相关全局变量
 global vllm_engine, vllm_sampling_params, model_asr_nano, asr_tokenizer, asr_frontend
@@ -145,7 +146,7 @@ def get_args():
     parser.add_argument(
         "--vllm_model_dir",
         type=str,
-        default="checkpoints/yuekai/Fun-ASR-Nano-2512-vllm",
+        default="yuekai/Fun-ASR-Nano-2512-vllm",
         help="vLLM 模型目录路径，如果提供则使用 vLLM 进行异步推理",
     )
     parser.add_argument(
@@ -188,6 +189,12 @@ if args.punc_model:
     else:
         args.punc_model = punc_model_dir
 
+vllm_model_dir = os.path.join(checkpoint_dir, args.vllm_model_dir)
+if not os.path.exists(vllm_model_dir):
+    logger.warning(f"{vllm_model_dir} 模型不存在, 不使用VLLM")
+    args.vllm_model_dir = None
+else:
+    args.vllm_model_dir = vllm_model_dir
 
 websocket_users = set()
 
@@ -618,7 +625,7 @@ async def async_asr(websocket, audio_in, sid):
         
         text = rec_result['text']
         if len(text)>0:
-            logger.info(f"2pass-offline, sid={sid}, name={state['wav_name']}: {text}" )
+            logger.info(f"2pass-offline, sid={sid}: {text}" )
         # 标点恢复
         if model_punc is not None and len(rec_result["text"]) > 0:
             # 异步并发调用标点模型
@@ -750,13 +757,17 @@ async def main():
             device=args.device,
             disable_pbar=True,
             disable_log=True,
+            disable_update=True,
             fp16=args.fp16,
         )
 
     # ASR Streaming 模型
     logger.info(f"Load ASR Online Model: {args.asr_model_online} ...")
     model_asr_streaming = AutoModel(
-        model=args.asr_model_online, model_revision=args.asr_model_online_revision)
+        model=args.asr_model_online, 
+        model_revision=args.asr_model_online_revision,
+        disable_update=True,
+    )
 
     # VAD 模型
     logger.info(f"Load VAD Model: {args.vad_model} ...")
@@ -770,6 +781,7 @@ async def main():
         device=args.device,
         disable_pbar=True,
         disable_log=True,
+        disable_update=True,
         fp16=args.fp16,
     )
 
@@ -784,6 +796,7 @@ async def main():
             device=args.device,
             disable_pbar=True,
             disable_log=True,
+            disable_update=True,
             fp16=args.fp16,
         )
     else:
@@ -796,6 +809,7 @@ async def main():
         logger.info(f"Initializing vLLM engine from {args.vllm_model_dir}...")
         try:            
             os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
+            os.environ["VLLM_LOGGER_LEVEL"] = "INFO"
             from vllm import LLM, SamplingParams, AsyncLLMEngine, AsyncEngineArgs
             from vllm.config import CompilationConfig  
             
